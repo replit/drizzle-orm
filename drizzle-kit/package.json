@@ -95,7 +95,7 @@
 		"get-port": "^6.1.2",
 		"glob": "^8.1.0",
 		"hanji": "^0.0.5",
-		"hono": "^4.7.9",
+		"hono": "^4.10.2",
 		"json-diff": "1.0.6",
 		"micromatch": "^4.0.8",
 		"minimatch": "^7.4.3",
