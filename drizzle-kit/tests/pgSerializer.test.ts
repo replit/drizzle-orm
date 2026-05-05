@@ -51,4 +51,42 @@ describe('fromDatabase', () => {
 		expect(observed.query).toHaveBeenCalled();
 		expect(observed.getMaxActiveQueries()).toBeLessThanOrEqual(2);
 	});
+
+	test('rejects invalid tableConcurrency values', async () => {
+		const observed = createObservedDb({ tableCount: 1 });
+
+		await expect(
+			fromDatabase(
+				observed.db as any,
+				undefined,
+				[],
+				undefined,
+				undefined,
+				undefined,
+				{ tableConcurrency: 0 },
+			),
+		).rejects.toThrow('tableConcurrency must be a positive integer');
+		await expect(
+			fromDatabase(
+				observed.db as any,
+				undefined,
+				[],
+				undefined,
+				undefined,
+				undefined,
+				{ tableConcurrency: -1 },
+			),
+		).rejects.toThrow('tableConcurrency must be a positive integer');
+		await expect(
+			fromDatabase(
+				observed.db as any,
+				undefined,
+				[],
+				undefined,
+				undefined,
+				undefined,
+				{ tableConcurrency: 1.5 },
+			),
+		).rejects.toThrow('tableConcurrency must be a positive integer');
+	});
 });

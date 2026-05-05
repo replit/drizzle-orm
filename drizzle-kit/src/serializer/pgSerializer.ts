@@ -53,13 +53,17 @@ async function mapWithConcurrency<T>(
 	concurrency: number | undefined,
 	fn: (item: T) => Promise<unknown>,
 ) {
-	if (concurrency === undefined || concurrency < 1) {
+	if (concurrency === undefined) {
 		await Promise.all(items.map(fn));
 		return;
 	}
 
+	if (!Number.isInteger(concurrency) || concurrency < 1) {
+		throw new RangeError('tableConcurrency must be a positive integer');
+	}
+
 	let nextIndex = 0;
-	const workerCount = Math.min(Math.floor(concurrency), items.length);
+	const workerCount = Math.min(concurrency, items.length);
 
 	await Promise.all(
 		Array.from({ length: workerCount }, async () => {
