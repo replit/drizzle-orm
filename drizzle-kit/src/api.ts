@@ -36,6 +36,9 @@ export type DrizzlePgDB = DB & {
 export type PreparePgDBOptions = {
 	queryConcurrency?: number;
 };
+export type IntrospectPgDBOptions = {
+	tableConcurrency?: number;
+};
 export type DrizzlePgDBIntrospectSchema = Omit<
 	PgSchemaKit,
 	'internal'
@@ -84,6 +87,7 @@ export const introspectPgDB = async (
 	db: DrizzlePgDB,
 	filters: string[],
 	schemaFilters: string[],
+	options: IntrospectPgDBOptions = {},
 ): Promise<DrizzlePgDBIntrospectSchema> => {
 	const matchers = filters.map((it) => {
 		return new Minimatch(it);
@@ -119,6 +123,7 @@ export const introspectPgDB = async (
 		undefined,
 		undefined,
 		undefined,
+		options,
 	);
 
 	const schema = { id: originUUID, prevId: '', ...res } as PgSchemaKit;
