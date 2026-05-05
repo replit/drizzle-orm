@@ -33,10 +33,52 @@ export type DrizzlePgDB = DB & {
 	proxy: Proxy;
 	migrate: (config: string | MigrationConfig) => Promise<void>;
 };
+export type PreparePgDBOptions = {
+	queryConcurrency?: number;
+};
 export type DrizzlePgDBIntrospectSchema = Omit<
 	PgSchemaKit,
 	'internal'
 >;
+
+function createConcurrencyLimiter(concurrency?: number) {
+	if (concurrency === undefined) {
+		return <T>(fn: () => Promise<T>) => fn();
+	}
+
+	if (!Number.isInteger(concurrency) || concurrency < 1) {
+		throw new RangeError('queryConcurrency must be a positive integer');
+	}
+
+	let activeCount = 0;
+	const queue: Array<() => void> = [];
+
+	const runNext = () => {
+		if (activeCount >= concurrency) return;
+
+		const next = queue.shift();
+		if (!next) return;
+
+		activeCount += 1;
+		next();
+	};
+
+	return <T>(fn: () => Promise<T>) => {
+		return new Promise<T>((resolve, reject) => {
+			queue.push(() => {
+				Promise.resolve()
+					.then(fn)
+					.then(resolve, reject)
+					.finally(() => {
+						activeCount -= 1;
+						runNext();
+					});
+			});
+
+			runNext();
+		});
+	};
+}
 
 export const introspectPgDB = async (
 	db: DrizzlePgDB,
@@ -86,6 +128,7 @@ export const introspectPgDB = async (
 
 export const preparePgDB = async (
 	pool: import('pg').Pool | import('pg').PoolClient,
+	options: PreparePgDBOptions = {},
 ): Promise<
 	DrizzlePgDB
 > => {
@@ -119,22 +162,27 @@ export const preparePgDB = async (
 	const migrateFn = async (config: MigrationConfig) => {
 		return migrate(db, config);
 	};
+	const limitQuery = createConcurrencyLimiter(options.queryConcurrency);
 
 	const query = async (sql: string, params?: any[]) => {
-		const result = await pool.query({
-			text: sql,
-			values: params ?? [],
-			types,
+		const result = await limitQuery(() => {
+			return pool.query({
+				text: sql,
+				values: params ?? [],
+				types,
+			});
 		});
 		return result.rows;
 	};
 
 	const proxy: Proxy = async (params: ProxyParams) => {
-		const result = await pool.query({
-			text: params.sql,
-			values: params.params,
-			...(params.mode === 'array' && { rowMode: 'array' }),
-			types,
+		const result = await limitQuery(() => {
+			return pool.query({
+				text: params.sql,
+				values: params.params,
+				...(params.mode === 'array' && { rowMode: 'array' }),
+				types,
+			});
 		});
 		return result.rows;
 	};
