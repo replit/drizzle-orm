@@ -42,8 +42,12 @@ export type DrizzlePgDBIntrospectSchema = Omit<
 >;
 
 function createConcurrencyLimiter(concurrency?: number) {
-	if (concurrency === undefined || concurrency < 1) {
+	if (concurrency === undefined) {
 		return <T>(fn: () => Promise<T>) => fn();
+	}
+
+	if (!Number.isInteger(concurrency) || concurrency < 1) {
+		throw new RangeError('queryConcurrency must be a positive integer');
 	}
 
 	let activeCount = 0;

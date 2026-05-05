@@ -77,4 +77,18 @@ describe('preparePgDB', () => {
 		expect(observed.query).toHaveBeenCalledTimes(5);
 		expect(observed.getMaxActiveQueries()).toBe(2);
 	});
+
+	test('rejects invalid queryConcurrency values', async () => {
+		const observed = createObservedPool();
+
+		await expect(
+			preparePgDB(observed.pool as any, { queryConcurrency: 0 }),
+		).rejects.toThrow('queryConcurrency must be a positive integer');
+		await expect(
+			preparePgDB(observed.pool as any, { queryConcurrency: -1 }),
+		).rejects.toThrow('queryConcurrency must be a positive integer');
+		await expect(
+			preparePgDB(observed.pool as any, { queryConcurrency: 1.5 }),
+		).rejects.toThrow('queryConcurrency must be a positive integer');
+	});
 });
