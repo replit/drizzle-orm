@@ -44,6 +44,34 @@ import type {
 import { type DB, escapeSingleQuotes, isPgArrayType } from '../utils';
 import { getColumnCasing, sqlToStr } from './utils';
 
+export type PgIntrospectOptions = {
+	tableConcurrency?: number;
+};
+
+async function mapWithConcurrency<T>(
+	items: T[],
+	concurrency: number | undefined,
+	fn: (item: T) => Promise<unknown>,
+) {
+	if (concurrency === undefined || concurrency < 1) {
+		await Promise.all(items.map(fn));
+		return;
+	}
+
+	let nextIndex = 0;
+	const workerCount = Math.min(Math.floor(concurrency), items.length);
+
+	await Promise.all(
+		Array.from({ length: workerCount }, async () => {
+			while (nextIndex < items.length) {
+				const currentIndex = nextIndex;
+				nextIndex += 1;
+				await fn(items[currentIndex]);
+			}
+		}),
+	);
+}
+
 export const indexName = (tableName: string, columns: string[]) => {
 	return `${tableName}_${columns.join('_')}_index`;
 };
@@ -983,6 +1011,7 @@ export const fromDatabase = async (
 		status: IntrospectStatus,
 	) => void,
 	tsSchema?: PgSchemaInternal,
+	options: PgIntrospectOptions = {},
 ): Promise<PgSchemaInternal> => {
 	const result: Record<string, Table> = {};
 	const views: Record<string, View> = {};
@@ -1209,13 +1238,20 @@ WHERE
 
 	const sequencesInColumns: string[] = [];
 
-	const all = allTables
-		.filter((it) => it.type === 'table')
-		.map((row) => {
+	const tableRows = allTables.filter((it) => it.type === 'table');
+	tableCount = tableRows.filter((row) => tablesFilter(row.table_name as string)).length;
+
+	if (progressCallback) {
+		progressCallback('tables', tableCount, 'done');
+	}
+
+	await mapWithConcurrency(
+		tableRows,
+		options.tableConcurrency,
+		async (row) => {
 			return new Promise(async (res, rej) => {
 				const tableName = row.table_name as string;
 				if (!tablesFilter(tableName)) return res('');
-				tableCount += 1;
 				const tableSchema = row.table_schema;
 
 				try {
@@ -1668,18 +1704,14 @@ WHERE
 				}
 				res('');
 			});
-		});
+		},
+	);
 
-	if (progressCallback) {
-		progressCallback('tables', tableCount, 'done');
-	}
-
-	for await (const _ of all) {
-	}
-
-	const allViews = allTables
-		.filter((it) => it.type === 'view' || it.type === 'materialized_view')
-		.map((row) => {
+	const viewRows = allTables.filter((it) => it.type === 'view' || it.type === 'materialized_view');
+	const allViews = mapWithConcurrency(
+		viewRows,
+		options.tableConcurrency,
+		async (row) => {
 			return new Promise(async (res, rej) => {
 				const viewName = row.table_name as string;
 				if (!tablesFilter(viewName)) return res('');
@@ -1899,12 +1931,12 @@ WHERE
 				}
 				res('');
 			});
-		});
+		},
+	);
 
-	viewsCount = allViews.length;
+	viewsCount = viewRows.length;
 
-	for await (const _ of allViews) {
-	}
+	await allViews;
 
 	if (progressCallback) {
 		progressCallback('columns', columnsCount, 'done');
