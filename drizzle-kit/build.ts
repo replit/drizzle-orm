@@ -69,7 +69,7 @@ const main = async () => {
 	});
 
 	await tsup.build({
-		entryPoints: ['./src/ext/api-postgres.ts', './src/ext/api-mysql.ts', './src/ext/api-sqlite.ts'],
+		entryPoints: ['./src/ext/api.ts', './src/ext/api-postgres.ts', './src/ext/api-mysql.ts', './src/ext/api-sqlite.ts'],
 		outDir: './dist',
 		external: [
 			'esbuild',
@@ -104,6 +104,11 @@ const main = async () => {
 			};
 		},
 	});
+
+	writeFileSync(
+		'./dist/api.js',
+		readFileSync('./dist/api.js', 'utf8').replace(/await import\(/g, 'require('),
+	);
 
 	writeFileSync(
 		'./dist/api-postgres.js',

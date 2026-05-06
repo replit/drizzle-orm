@@ -1,5 +1,5 @@
 {
-	"name": "drizzle-kit",
+	"name": "@drizzle-team/drizzle-kit",
 	"version": "1.0.0-rc.2",
 	"homepage": "https://orm.drizzle.team",
 	"keywords": [
@@ -44,7 +44,8 @@
 		"build:ext": "rm -rf ./dist && vitest run bin.test && vitest run ./tests/postgres/ && vitest run ./tests/sqlite && vitest run ./tests/mysql && tsx build.ext.ts",
 		"pack": "cp package.json README.md dist/ && (cd dist && npm pack --pack-destination ..) && rm -f package.tgz && mv *.tgz package.tgz",
 		"pack:artifact": "pnpm run pack",
-		"publish": "npm publish package.tgz",
+		"login": "npx google-artifactregistry-auth --repo-config ~/.npmrc",
+		"publish": "npm publish package.tgz --provenance=false",
 		"test:postgres": "vitest run ./postgres/",
 		"test:other": "vitest run ./mysql/ ./sqlite/ ./other",
 		"test:cockroach": "vitest run ./cockroach",
@@ -146,6 +147,18 @@
 			},
 			"types": "./api-postgres.d.mts",
 			"default": "./api-postgres.mjs"
+		},
+		"./api": {
+			"import": {
+				"types": "./api.d.mts",
+				"default": "./api.mjs"
+			},
+			"require": {
+				"types": "./api.d.ts",
+				"default": "./api.js"
+			},
+			"types": "./api.d.mts",
+			"default": "./api.mjs"
 		},
 		"./api-mysql": {
 			"import": {

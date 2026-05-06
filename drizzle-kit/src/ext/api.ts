@@ -1,345 +1,443 @@
-// import { LibSQLDatabase } from 'drizzle-orm/libsql';
-// import type { MySql2Database } from 'drizzle-orm/mysql2';
-// import { PgDatabase } from 'drizzle-orm/pg-core';
-// import { SingleStoreDriverDatabase } from 'drizzle-orm/singlestore';
-// import { introspect as postgresIntrospect } from '../cli/commands/pull-postgres';
-// import { sqliteIntrospect } from '../cli/commands/pull-sqlite';
-// import { suggestions } from '../cli/commands/push-postgres';
-// import { updateUpToV6 as upPgV6, updateUpToV7 as upPgV7 } from '../cli/commands/up-postgres';
-// import { resolver } from '../cli/prompts';
-// import type { CasingType } from '../cli/validations/common';
-// import { ProgressView, schemaError, schemaWarning } from '../cli/views';
-// import { fromDrizzleSchema, fromExports } from '../dialects/postgres/drizzle';
-// import { PostgresSnapshot, toJsonSnapshot } from '../dialects/postgres/snapshot';
-// import type { Config } from '../index';
-// import { originUUID } from '../utils';
-// import type { DB, SQLiteDB } from '../utils';
-// import { getTablesFilterByExtensions } from './extensions/getTablesFilterByExtensions';
+import type { MigrationConfig, MigratorInitFailResponse } from 'drizzle-orm/migrator';
+import type { Pool, PoolClient } from 'pg';
+import type { Resolver } from '../dialects/common';
+import { fromJson } from '../dialects/postgres/convertor';
+import type {
+	CheckConstraint,
+	Column,
+	Enum,
+	ForeignKey,
+	Index,
+	InterimSchema,
+	Policy,
+	PostgresDDL,
+	PostgresEntities,
+	PrimaryKey,
+	Privilege,
+	Role,
+	Schema,
+	Sequence,
+	UniqueConstraint,
+	View,
+} from '../dialects/postgres/ddl';
+import { createDDL, interimToDDL } from '../dialects/postgres/ddl';
+import { ddlDiff } from '../dialects/postgres/diff';
+import { fromDatabaseForDrizzle } from '../dialects/postgres/introspect';
+import type { JsonStatement } from '../dialects/postgres/statements';
+import { prepareEntityFilter } from '../dialects/pull-utils';
+import type { DB, Proxy } from '../utils';
+import '../@types/utils';
 
-// import * as postgres from './api-postgres';
+type Queryable = Pool | PoolClient;
 
-// SQLite
+export type DrizzlePgDB = DB & {
+	proxy: Proxy;
+	migrate: (config: string | MigrationConfig) => Promise<void | MigratorInitFailResponse>;
+};
 
-// TODO commented this because of build error
-// export const generateSQLiteDrizzleJson = async (
-// 	imports: Record<string, unknown>,
-// 	prevId?: string,
-// 	casing?: CasingType,
-// ): Promise<SQLiteSchemaKit> => {
-// 	const { prepareFromExports } = await import('./dialects/sqlite/imports');
+export type PreparePgDBOptions = {
+	queryConcurrency?: number;
+};
 
-// 	const prepared = prepareFromExports(imports);
+export type DrizzlePgDBIntrospectSchema = InterimSchema | LegacyEmptyPgSchema;
 
-// 	const id = randomUUID();
+type LegacyEmptyPgSchema = {
+	version: string;
+	dialect: 'postgresql';
+	id: string;
+	prevId: string;
+	tables: Record<string, unknown>;
+	enums: Record<string, unknown>;
+	schemas: Record<string, unknown>;
+	policies: Record<string, unknown>;
+	roles: Record<string, unknown>;
+	sequences: Record<string, unknown>;
+	views: Record<string, unknown>;
+	_meta: Record<string, unknown>;
+};
 
-// 	const snapshot = fromDrizzleSchema(prepared.tables, prepared.views, casing);
+type Named = { name: string; schema?: string; table?: string };
+type RenamePromptItem<T extends Named> = { from: T; to: T };
+type LegacyResolverInput<T extends Named> = {
+	created: T[];
+	deleted: T[];
+	schema?: string;
+	tableName?: string;
+};
+type LegacyResolverOutput<T extends Named> = {
+	created: T[];
+	deleted: T[];
+	renamed?: RenamePromptItem<T>[];
+	renamedOrMoved?: RenamePromptItem<T>[];
+	moved?: { name: string; schemaFrom: string; schemaTo: string }[];
+};
+type LegacyResolver<T extends Named = any> = (input: LegacyResolverInput<T>) => Promise<LegacyResolverOutput<T>>;
 
-// 	return {
-// 		...snapshot,
-// 		id,
-// 		prevId: prevId ?? originUUID,
-// 	};
-// };
+const defaultMigrationsConfig = {
+	schema: 'drizzle',
+	table: '__drizzle_migrations',
+};
 
-// export const generateSQLiteMigration = async (
-// 	prev: DrizzleSQLiteSnapshotJSON,
-// 	cur: DrizzleSQLiteSnapshotJSON,
-// ) => {
-// 	const { applySqliteSnapshotsDiff } = await import('./dialects/sqlite/diff');
+const passthroughResolver: LegacyResolver = async ({ created, deleted }) => {
+	return { created, deleted, renamed: [] };
+};
 
-// 	const validatedPrev = sqliteSchema.parse(prev);
-// 	const validatedCur = sqliteSchema.parse(cur);
+export const schemasResolver = passthroughResolver;
+export const enumsResolver = passthroughResolver;
+export const sequencesResolver = passthroughResolver;
+export const policyResolver = passthroughResolver;
+export const indPolicyResolver = passthroughResolver;
+export const roleResolver = passthroughResolver;
+export const tablesResolver = passthroughResolver;
+export const columnsResolver = passthroughResolver;
+export const viewsResolver = passthroughResolver;
 
-// 	const squashedPrev = squashSqliteScheme(validatedPrev);
-// 	const squashedCur = squashSqliteScheme(validatedCur);
+export type ResolverInput<T extends Named = Named> = LegacyResolverInput<T>;
+export type ColumnsResolverInput = LegacyResolverInput<Column>;
+export type PolicyResolverInput = LegacyResolverInput<Policy>;
+export type TablePolicyResolverInput = LegacyResolverInput<Policy>;
+export type RolesResolverInput = LegacyResolverInput<Role>;
+export type { Enum, Role, Sequence, View };
+export type Table = PostgresEntities['tables'];
 
-// 	const { sqlStatements } = await applySqliteSnapshotsDiff(
-// 		squashedPrev,
-// 		squashedCur,
-// 		tablesResolver,
-// 		columnsResolver,
-// 		sqliteViewsResolver,
-// 		validatedPrev,
-// 		validatedCur,
-// 	);
+export type SelectResolverInput = {
+	entity: {
+		type: 'createUniqueConstraint';
+		name: string;
+		count: number;
+		tableName: string;
+	};
+	items: string[];
+};
 
-// 	return sqlStatements;
-// };
+export type SelectResolverOutput = {
+	data: {
+		index: number;
+		value: string;
+	};
+};
 
-// export const pushSQLiteSchema = async (
-// 	imports: Record<string, unknown>,
-// 	drizzleInstance: LibSQLDatabase<any>,
-// ) => {
-// 	const { applySqliteSnapshotsDiff } = await import('./dialects/sqlite/diff');
-// 	const { sql } = await import('drizzle-orm');
+function createConcurrencyLimiter(concurrency?: number) {
+	if (concurrency === undefined) {
+		return <T>(fn: () => Promise<T>) => fn();
+	}
 
-// 	const db: SQLiteDB = {
-// 		query: async (query: string, params?: any[]) => {
-// 			const res = drizzleInstance.all<any>(sql.raw(query));
-// 			return res;
-// 		},
-// 		run: async (query: string) => {
-// 			return Promise.resolve(drizzleInstance.run(sql.raw(query))).then(
-// 				() => {},
-// 			);
-// 		},
-// 	};
+	if (!Number.isInteger(concurrency) || concurrency < 1) {
+		throw new RangeError('queryConcurrency must be a positive integer');
+	}
 
-// 	const cur = await generateSQLiteDrizzleJson(imports);
-// 	const progress = new ProgressView(
-// 		'Pulling schema from database...',
-// 		'Pulling schema from database...',
-// 	);
+	let activeCount = 0;
+	const queue: Array<() => void> = [];
 
-// 	const { schema: prev } = await sqliteIntrospect(db, [], progress);
+	const runNext = () => {
+		if (activeCount >= concurrency) return;
 
-// 	const validatedPrev = sqliteSchema.parse(prev);
-// 	const validatedCur = sqliteSchema.parse(cur);
+		const next = queue.shift();
+		if (!next) return;
 
-// 	const squashedPrev = squashSqliteScheme(validatedPrev, 'push');
-// 	const squashedCur = squashSqliteScheme(validatedCur, 'push');
+		activeCount += 1;
+		next();
+	};
 
-// 	const { statements, _meta } = await applySqliteSnapshotsDiff(
-// 		squashedPrev,
-// 		squashedCur,
-// 		tablesResolver,
-// 		columnsResolver,
-// 		sqliteViewsResolver,
-// 		validatedPrev,
-// 		validatedCur,
-// 		'push',
-// 	);
+	return <T>(fn: () => Promise<T>) => {
+		return new Promise<T>((resolve, reject) => {
+			queue.push(() => {
+				Promise.resolve()
+					.then(fn)
+					.then(resolve, reject)
+					.finally(() => {
+						activeCount -= 1;
+						runNext();
+					});
+			});
 
-// 	const { shouldAskForApprove, statementsToExecute, infoToPrint } = await logSuggestionsAndReturn(
-// 		db,
-// 		statements,
-// 		squashedPrev,
-// 		squashedCur,
-// 		_meta!,
-// 	);
+			runNext();
+		});
+	};
+}
 
-// 	return {
-// 		hasDataLoss: shouldAskForApprove,
-// 		warnings: infoToPrint,
-// 		statementsToExecute,
-// 		apply: async () => {
-// 			for (const dStmnt of statementsToExecute) {
-// 				await db.query(dStmnt);
-// 			}
-// 		},
-// 	};
-// };
+export const preparePgDB = async (
+	pool: Queryable,
+	options: PreparePgDBOptions = {},
+): Promise<DrizzlePgDB> => {
+	const { default: pg } = await import('pg');
+	const { drizzle } = await import('drizzle-orm/node-postgres');
+	const { migrate } = await import('drizzle-orm/node-postgres/migrator');
 
-// MySQL
-// TODO commented this because of build error
-// export const generateMySQLDrizzleJson = async (
-// 	imports: Record<string, unknown>,
-// 	prevId?: string,
-// 	casing?: CasingType,
-// ): Promise<MySQLSchemaKit> => {
-// 	const { prepareFromExports } = await import('./serializer/mysqlImports');
+	const getTypeParser: typeof pg.types.getTypeParser = (typeId, format) => {
+		if (typeId === pg.types.builtins.TIMESTAMPTZ) {
+			return (val: string) => val;
+		}
+		if (typeId === pg.types.builtins.TIMESTAMP) {
+			return (val: string) => val;
+		}
+		if (typeId === pg.types.builtins.DATE) {
+			return (val: string) => val;
+		}
+		if (typeId === pg.types.builtins.INTERVAL) {
+			return (val: string) => val;
+		}
 
-// 	const prepared = prepareFromExports(imports);
+		return pg.types.getTypeParser(typeId, format);
+	};
 
-// 	const id = randomUUID();
+	const db = drizzle(pool as any);
+	const limitQuery = createConcurrencyLimiter(options.queryConcurrency);
+	const queryable = pool as { query: (config: unknown) => Promise<{ rows: any[] }> };
+	const types = { getTypeParser };
 
-// 	const snapshot = generateMySqlSnapshot(prepared.tables, prepared.views, casing);
+	const query = async <T extends any = any>(sql: string, params?: any[]): Promise<T[]> => {
+		const result = await limitQuery(() => {
+			return queryable.query({
+				text: sql,
+				values: params ?? [],
+				types,
+			});
+		});
+		return result.rows;
+	};
 
-// 	return {
-// 		...snapshot,
-// 		id,
-// 		prevId: prevId ?? originUUID,
-// 	};
-// };
+	const proxy: Proxy = async (params) => {
+		const result = await limitQuery(() => {
+			return queryable.query({
+				text: params.sql,
+				values: params.params,
+				...(params.mode === 'array' && { rowMode: 'array' }),
+				types,
+			});
+		});
+		return result.rows;
+	};
 
-// export const generateMySQLMigration = async (
-// 	prev: DrizzleMySQLSnapshotJSON,
-// 	cur: DrizzleMySQLSnapshotJSON,
-// ) => {
-// 	const { ddlDiff: applyMysqlSnapshotsDiff } = await import('./dialects/mysql/mysql');
+	const migrateFn = async (config: string | MigrationConfig) => {
+		return migrate(db, config as MigrationConfig);
+	};
 
-// 	const validatedPrev = mysqlSchema.parse(prev);
-// 	const validatedCur = mysqlSchema.parse(cur);
+	return { query, proxy, migrate: migrateFn };
+};
 
-// 	const squashedPrev = squashMysqlScheme(validatedPrev);
-// 	const squashedCur = squashMysqlScheme(validatedCur);
+export const introspectPgDB = async (
+	db: DrizzlePgDB,
+	filters: string[],
+	schemaFilters: string[],
+): Promise<InterimSchema> => {
+	const filter = prepareEntityFilter('postgresql', {
+		tables: filters,
+		schemas: schemaFilters,
+		entities: undefined,
+		extensions: [],
+	}, []);
 
-// 	const { sqlStatements } = await applyMysqlSnapshotsDiff(
-// 		squashedPrev,
-// 		squashedCur,
-// 		tablesResolver,
-// 		columnsResolver,
-// 		mySqlViewsResolver,
-// 		uniqueResolver,
-// 		validatedPrev,
-// 		validatedCur,
-// 	);
+	return fromDatabaseForDrizzle(db, filter, () => {}, defaultMigrationsConfig);
+};
 
-// 	return sqlStatements;
-// };
+function isDDL(schema: unknown): schema is PostgresDDL {
+	return typeof schema === 'object' && schema !== null && 'entities' in schema;
+}
 
-// export const pushMySQLSchema = async (
-// 	imports: Record<string, unknown>,
-// 	drizzleInstance: MySql2Database<any>,
-// 	databaseName: string,
-// ) => {
-// 	const { ddlDiff: applyMysqlSnapshotsDiff } = await import('./dialects/mysql/mysql');
-// 	const { logSuggestionsAndReturn } = await import(
-// 		'./cli/commands/mysqlPushUtils'
-// 	);
-// 	const { mysqlPushIntrospect } = await import(
-// 		'./cli/commands/pull-mysql'
-// 	);
-// 	const { sql } = await import('drizzle-orm');
+function isInterimSchema(schema: unknown): schema is InterimSchema {
+	return typeof schema === 'object'
+		&& schema !== null
+		&& Array.isArray((schema as InterimSchema).tables)
+		&& Array.isArray((schema as InterimSchema).columns);
+}
 
-// 	const db: DB = {
-// 		query: async (query: string, params?: any[]) => {
-// 			const res = await drizzleInstance.execute(sql.raw(query));
-// 			return res[0] as unknown as any[];
-// 		},
-// 	};
-// 	const cur = await generateMySQLDrizzleJson(imports);
-// 	const { schema: prev } = await mysqlPushIntrospect(db, databaseName, []);
+export const pgSchema = {
+	parse: (schema: DrizzlePgDBIntrospectSchema) => schema,
+};
 
-// 	const validatedPrev = mysqlSchema.parse(prev);
-// 	const validatedCur = mysqlSchema.parse(cur);
+export const squashPgScheme = (
+	schema: DrizzlePgDBIntrospectSchema | PostgresDDL,
+	_mode?: 'default' | 'push',
+): PostgresDDL => {
+	if (isDDL(schema)) {
+		return schema;
+	}
 
-// 	const squashedPrev = squashMysqlScheme(validatedPrev);
-// 	const squashedCur = squashMysqlScheme(validatedCur);
+	if (!isInterimSchema(schema)) {
+		return createDDL();
+	}
 
-// 	const { statements } = await applyMysqlSnapshotsDiff(
-// 		squashedPrev,
-// 		squashedCur,
-// 		tablesResolver,
-// 		columnsResolver,
-// 		mySqlViewsResolver,
-// 		uniqueResolver,
-// 		validatedPrev,
-// 		validatedCur,
-// 		'push',
-// 	);
+	const { ddl, errors } = interimToDDL(schema);
+	if (errors.length > 0) {
+		throw new Error(`Failed to convert Postgres schema: ${errors.join('\n')}`);
+	}
 
-// 	const { shouldAskForApprove, statementsToExecute, infoToPrint } = await logSuggestionsAndReturn(
-// 		db,
-// 		statements,
-// 		validatedCur,
-// 	);
+	return ddl;
+};
 
-// 	return {
-// 		hasDataLoss: shouldAskForApprove,
-// 		warnings: infoToPrint,
-// 		statementsToExecute,
-// 		apply: async () => {
-// 			for (const dStmnt of statementsToExecute) {
-// 				await db.query(dStmnt);
-// 			}
-// 		},
-// 	};
-// };
+function movedToRenamed<T extends Named>(
+	moved: { name: string; schemaFrom: string; schemaTo: string },
+	created: T[],
+	deleted: T[],
+): RenamePromptItem<T> {
+	const from = deleted.find((item) => item.name === moved.name && (item.schema ?? 'public') === moved.schemaFrom)
+		?? ({ name: moved.name, schema: moved.schemaFrom } as T);
+	const to = created.find((item) => item.name === moved.name && (item.schema ?? 'public') === moved.schemaTo)
+		?? ({ name: moved.name, schema: moved.schemaTo } as T);
 
-// SingleStore
-// TODO commented this because of build error
-// export const generateSingleStoreDrizzleJson = async (
-// 	imports: Record<string, unknown>,
-// 	prevId?: string,
-// 	casing?: CasingType,
-// ): Promise<SingleStoreSchemaKit> => {
-// 	const { prepareFromExports } = await import('./serializer/singlestoreImports');
+	return { from, to };
+}
 
-// 	const prepared = prepareFromExports(imports);
+function adaptResolver<T extends Named>(resolver: LegacyResolver<T>): Resolver<T> {
+	return async ({ created, deleted }) => {
+		const sample = created[0] ?? deleted[0];
+		const result = await resolver({
+			created,
+			deleted,
+			schema: sample?.schema,
+			tableName: sample?.table,
+		});
 
-// 	const id = randomUUID();
+		const renamedOrMoved = [
+			...(result.renamed ?? []),
+			...(result.renamedOrMoved ?? []),
+			...(result.moved ?? []).map((move) => movedToRenamed(move, created, deleted)),
+		];
 
-// 	const snapshot = generateSingleStoreSnapshot(prepared.tables, /* prepared.views, */ casing);
+		return {
+			created: result.created,
+			deleted: result.deleted,
+			renamedOrMoved,
+		};
+	};
+}
 
-// 	return {
-// 		...snapshot,
-// 		id,
-// 		prevId: prevId ?? originUUID,
-// 	};
-// };
+const noOpV1Resolver: Resolver<any> = async ({ created, deleted }) => {
+	return { created, deleted, renamedOrMoved: [] };
+};
 
-// export const generateSingleStoreMigration = async (
-// 	prev: DrizzleSingleStoreSnapshotJSON,
-// 	cur: DrizzleSingleStoreSnapshotJSON,
-// ) => {
-// 	const { applySingleStoreSnapshotsDiff } = await import('./snapshot-differ/singlestore');
+export const applyPgSnapshotsDiff = async (
+	targetSchema: PostgresDDL,
+	sourceSchema: PostgresDDL,
+	schemasResolverArg: LegacyResolver<Schema>,
+	enumsResolverArg: LegacyResolver<Enum>,
+	sequencesResolverArg: LegacyResolver<Sequence>,
+	policyResolverArg: LegacyResolver<Policy>,
+	_indPolicyResolverArg: LegacyResolver<any>,
+	roleResolverArg: LegacyResolver<Role>,
+	tablesResolverArg: LegacyResolver<PostgresEntities['tables']>,
+	columnsResolverArg: LegacyResolver<Column>,
+	viewsResolverArg: LegacyResolver<View>,
+	_validatedTarget: DrizzlePgDBIntrospectSchema,
+	_validatedSource: DrizzlePgDBIntrospectSchema,
+	mode: 'default' | 'push',
+) => {
+	return ddlDiff(
+		targetSchema,
+		sourceSchema,
+		adaptResolver(schemasResolverArg),
+		adaptResolver(enumsResolverArg),
+		adaptResolver(sequencesResolverArg),
+		adaptResolver(policyResolverArg),
+		adaptResolver(roleResolverArg),
+		noOpV1Resolver as Resolver<Privilege>,
+		adaptResolver(tablesResolverArg),
+		adaptResolver(columnsResolverArg),
+		adaptResolver(viewsResolverArg),
+		noOpV1Resolver as Resolver<UniqueConstraint>,
+		noOpV1Resolver as Resolver<Index>,
+		noOpV1Resolver as Resolver<CheckConstraint>,
+		noOpV1Resolver as Resolver<PrimaryKey>,
+		noOpV1Resolver as Resolver<ForeignKey>,
+		mode,
+	);
+};
 
-// 	const validatedPrev = singlestoreSchema.parse(prev);
-// 	const validatedCur = singlestoreSchema.parse(cur);
+function quotedIdentifier({ schema, name }: { schema?: string; name: string }) {
+	return schema && schema !== 'public' ? `"${schema}"."${name}"` : `"${name}"`;
+}
 
-// 	const squashedPrev = squashSingleStoreScheme(validatedPrev);
-// 	const squashedCur = squashSingleStoreScheme(validatedCur);
+async function maybeAddUniqueTruncateStatement({
+	db,
+	statement,
+	selectResolver,
+}: {
+	db: DB;
+	statement: Extract<JsonStatement, { type: 'add_unique' }>;
+	selectResolver?: (input: SelectResolverInput) => Promise<SelectResolverOutput>;
+}) {
+	if (!selectResolver) {
+		return;
+	}
 
-// 	const { sqlStatements } = await applySingleStoreSnapshotsDiff(
-// 		squashedPrev,
-// 		squashedCur,
-// 		tablesResolver,
-// 		columnsResolver,
-// 		/* singleStoreViewsResolver, */
-// 		validatedPrev,
-// 		validatedCur,
-// 		'push',
-// 	);
+	const unique = statement.unique;
+	const tableName = quotedIdentifier({ schema: unique.schema, name: unique.table });
+	const res = await db.query<{ count: string | number }>(`select count(*) as count from ${tableName}`);
+	const count = Number(res[0]?.count ?? 0);
+	if (count <= 0) {
+		return;
+	}
 
-// 	return sqlStatements;
-// };
+	const { data } = await selectResolver({
+		entity: {
+			type: 'createUniqueConstraint',
+			name: unique.name,
+			count,
+			tableName: unique.table,
+		},
+		items: ['no', 'yes'],
+	});
 
-// export const pushSingleStoreSchema = async (
-// 	imports: Record<string, unknown>,
-// 	drizzleInstance: SingleStoreDriverDatabase<any>,
-// 	databaseName: string,
-// ) => {
-// 	const { applySingleStoreSnapshotsDiff } = await import('./snapshot-differ/singlestore');
-// 	const { logSuggestionsAndReturn } = await import(
-// 		'./cli/commands/singlestorePushUtils'
-// 	);
-// 	const { singlestorePushIntrospect } = await import(
-// 		'./cli/commands/pull-singlestore'
-// 	);
-// 	const { sql } = await import('drizzle-orm');
+	if (data?.index !== 1) {
+		return;
+	}
 
-// 	const db: DB = {
-// 		query: async (query: string) => {
-// 			const res = await drizzleInstance.execute(sql.raw(query));
-// 			return res[0] as unknown as any[];
-// 		},
-// 	};
-// 	const cur = await generateSingleStoreDrizzleJson(imports);
-// 	const { schema: prev } = await singlestorePushIntrospect(db, databaseName, []);
+	return {
+		statement: `truncate table ${tableName} cascade;`,
+		table: unique.table,
+	};
+}
 
-// 	const validatedPrev = singlestoreSchema.parse(prev);
-// 	const validatedCur = singlestoreSchema.parse(cur);
+export const pgSuggestions = async (
+	db: DB,
+	statements: JsonStatement[],
+	selectResolver?: (input: SelectResolverInput) => Promise<SelectResolverOutput>,
+) => {
+	const { suggestions } = await import('../cli/commands/push-postgres');
+	const hints = await suggestions(db, statements);
+	const { sqlStatements } = fromJson(statements);
 
-// 	const squashedPrev = squashSingleStoreScheme(validatedPrev);
-// 	const squashedCur = squashSingleStoreScheme(validatedCur);
+	const statementsToExecute = hints
+		.map((hint) => hint.statement)
+		.filter((statement): statement is string => typeof statement !== 'undefined');
+	const infoToPrint = hints.map((hint) => hint.hint);
+	const matViewsToRemove: string[] = [];
+	const columnsToRemove: string[] = [];
+	const schemasToRemove: string[] = [];
+	const tablesToTruncate: string[] = [];
+	const tablesToRemove: string[] = [];
 
-// 	const { statements } = await applySingleStoreSnapshotsDiff(
-// 		squashedPrev,
-// 		squashedCur,
-// 		tablesResolver,
-// 		columnsResolver,
-// 		/* singleStoreViewsResolver, */
-// 		validatedPrev,
-// 		validatedCur,
-// 		'push',
-// 	);
+	for (const statement of statements) {
+		if (statement.type === 'drop_table') {
+			tablesToRemove.push(statement.table.name);
+		} else if (statement.type === 'drop_view' && statement.view.materialized) {
+			matViewsToRemove.push(statement.view.name);
+		} else if (statement.type === 'drop_column') {
+			columnsToRemove.push(`${statement.column.table}_${statement.column.name}`);
+		} else if (statement.type === 'drop_schema') {
+			schemasToRemove.push(statement.name);
+		} else if (statement.type === 'alter_column' && statement.diff.type) {
+			tablesToTruncate.push(statement.to.table);
+		} else if (statement.type === 'add_column' && statement.column.notNull && !statement.column.default) {
+			tablesToTruncate.push(statement.column.table);
+		} else if (statement.type === 'add_unique') {
+			const truncate = await maybeAddUniqueTruncateStatement({ db, statement, selectResolver });
+			if (truncate) {
+				statementsToExecute.push(truncate.statement);
+				tablesToTruncate.push(truncate.table);
+			}
+		}
+	}
 
-// 	const { shouldAskForApprove, statementsToExecute, infoToPrint } = await logSuggestionsAndReturn(
-// 		db,
-// 		statements,
-// 		validatedCur,
-// 		validatedPrev,
-// 	);
-
-// 	return {
-// 		hasDataLoss: shouldAskForApprove,
-// 		warnings: infoToPrint,
-// 		statementsToExecute,
-// 		apply: async () => {
-// 			for (const dStmnt of statementsToExecute) {
-// 				await db.query(dStmnt);
-// 			}
-// 		},
-// 	};
-// };
+	return {
+		statementsToExecute: [...new Set([...statementsToExecute, ...sqlStatements])],
+		shouldAskForApprove: infoToPrint.length > 0 || tablesToTruncate.length > 0,
+		infoToPrint,
+		matViewsToRemove: [...new Set(matViewsToRemove)],
+		columnsToRemove: [...new Set(columnsToRemove)],
+		schemasToRemove: [...new Set(schemasToRemove)],
+		tablesToTruncate: [...new Set(tablesToTruncate)],
+		tablesToRemove: [...new Set(tablesToRemove)],
+	};
+};

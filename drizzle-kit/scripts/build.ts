@@ -108,7 +108,7 @@ async function buildDeclarations() {
 	});
 
 	await tsdown({
-		entry: ['./src/ext/api-postgres.ts', './src/ext/api-mysql.ts', './src/ext/api-sqlite.ts'],
+		entry: ['./src/ext/api.ts', './src/ext/api-postgres.ts', './src/ext/api-mysql.ts', './src/ext/api-sqlite.ts'],
 		outDir: './dist',
 		external: ['esbuild', 'drizzle-orm', ...driversPackages, /^drizzle-orm\/?/],
 		dts: { emitDtsOnly: true },
@@ -127,7 +127,7 @@ async function buildDeclarations() {
 }
 
 async function postProcessApiFiles() {
-	const apiFiles = ['dist/api-postgres.js', 'dist/api-mysql.js', 'dist/api-sqlite.js'];
+	const apiFiles = ['dist/api.js', 'dist/api-postgres.js', 'dist/api-mysql.js', 'dist/api-sqlite.js'];
 	await Promise.all(
 		apiFiles.map(async (file) => {
 			if (existsSync(file)) {
@@ -154,6 +154,18 @@ async function main() {
 			name: 'index-esm',
 			input: './src/index.ts',
 			outputName: 'index.mjs',
+			format: 'esm',
+		}),
+		buildBundle({
+			name: 'api-cjs',
+			input: './src/ext/api.ts',
+			outputName: 'api.js',
+			format: 'cjs',
+		}),
+		buildBundle({
+			name: 'api-esm',
+			input: './src/ext/api.ts',
+			outputName: 'api.mjs',
 			format: 'esm',
 		}),
 		buildBundle({
