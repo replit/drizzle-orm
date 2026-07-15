@@ -753,6 +753,28 @@ test('alter composite primary key', async () => {
 	]);
 });
 
+test('drop foreign key constraint idempotently', async () => {
+	const users = pgTable('users', {
+		id: integer('id').primaryKey(),
+	});
+	const postsFrom = pgTable('posts', {
+		userId: integer('user_id').references(() => users.id),
+	});
+	const postsTo = pgTable('posts', {
+		userId: integer('user_id'),
+	});
+
+	const { sqlStatements } = await diffTestSchemas(
+		{ users, posts: postsFrom },
+		{ users, posts: postsTo },
+		[],
+	);
+
+	expect(sqlStatements).toStrictEqual([
+		'ALTER TABLE "posts" DROP CONSTRAINT IF EXISTS "posts_user_id_users_id_fk";\n',
+	]);
+});
+
 test('add index with op', async () => {
 	const from = {
 		users: pgTable('users', {
