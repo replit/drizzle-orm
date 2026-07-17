@@ -47,7 +47,9 @@
 		"build:ext": "rm -rf ./dist && vitest run bin.test && vitest run ./tests/postgres/ && vitest run ./tests/sqlite && vitest run ./tests/mysql && tsx build.ext.ts",
 		"pack": "cp package.json README.md dist/ && (cd dist && npm pack --pack-destination ..) && rm -f package.tgz && mv *.tgz package.tgz",
 		"pack:artifact": "pnpm run pack",
+		"pack:replit": "pnpm run build && tsx scripts/prepare-replit-package.ts && (cd dist && npm pack --pack-destination ..) && rm -f package.tgz && mv *.tgz package.tgz",
 		"publish": "npm publish package.tgz",
+		"publish:replit": "pnpm run pack:replit && npm publish package.tgz --provenance=false",
 		"test:postgres": "vitest run ./postgres/",
 		"test:other": "vitest run ./mysql/ ./sqlite/ ./other",
 		"test:cockroach": "vitest run ./cockroach",
@@ -140,6 +142,18 @@
 			},
 			"types": "./index.d.mts",
 			"default": "./index.mjs"
+		},
+		"./api": {
+			"import": {
+				"types": "./api.d.mts",
+				"default": "./api.mjs"
+			},
+			"require": {
+				"types": "./api.d.ts",
+				"default": "./api.js"
+			},
+			"types": "./api.d.mts",
+			"default": "./api.mjs"
 		},
 		"./api-postgres": {
 			"import": {

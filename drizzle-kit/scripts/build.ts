@@ -115,6 +115,7 @@ async function buildDeclarations() {
 
 	await tsdown({
 		entry: {
+			api: './src/ext/api.ts',
 			'api-postgres': './src/ext/api-postgres.ts',
 			'api-mysql': './src/ext/api-mysql.ts',
 			'api-sqlite': './src/ext/api-sqlite.ts',
@@ -152,6 +153,7 @@ async function copyDeclarationsAndCleanTemp() {
 
 async function postProcessApiFiles() {
 	const apiFiles = [
+		'dist/api.js',
 		'dist/api-postgres.js',
 		'dist/api-mysql.js',
 		'dist/api-sqlite.js',
@@ -186,6 +188,18 @@ async function main() {
 			name: 'index-esm',
 			input: './src/index.ts',
 			outputName: 'index.mjs',
+			format: 'esm',
+		}),
+		buildBundle({
+			name: 'api-cjs',
+			input: './src/ext/api.ts',
+			outputName: 'api.js',
+			format: 'cjs',
+		}),
+		buildBundle({
+			name: 'api-esm',
+			input: './src/ext/api.ts',
+			outputName: 'api.mjs',
 			format: 'esm',
 		}),
 		buildBundle({
