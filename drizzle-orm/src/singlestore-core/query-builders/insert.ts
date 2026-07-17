@@ -14,7 +14,7 @@ import type {
 import type { SingleStoreTable } from '~/singlestore-core/table.ts';
 import type { Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
 import { Param, SQL, sql } from '~/sql/sql.ts';
-import type { InferModelFromColumns } from '~/table.ts';
+import type { InferInsertModel, InferModelFromColumns } from '~/table.ts';
 import { Table } from '~/table.ts';
 import { mapUpdateSet, orderSelectedFields } from '~/utils.ts';
 import type { AnySingleStoreColumn, SingleStoreColumn } from '../columns/common.ts';
@@ -32,9 +32,12 @@ export interface SingleStoreInsertConfig<TTable extends SingleStoreTable = Singl
 
 export type AnySingleStoreInsertConfig = SingleStoreInsertConfig<SingleStoreTable>;
 
-export type SingleStoreInsertValue<TTable extends SingleStoreTable> =
+export type SingleStoreInsertValue<
+	TTable extends SingleStoreTable,
+	TModel extends Record<string, any> = InferInsertModel<TTable>,
+> =
 	& {
-		[Key in keyof TTable['$inferInsert']]: TTable['$inferInsert'][Key] | SQL | Placeholder;
+		[Key in keyof TModel]: TModel[Key] | SQL | Placeholder;
 	}
 	& {};
 
@@ -72,7 +75,7 @@ export class SingleStoreInsertBuilder<
 			const cols = this.table[Table.Symbol.Columns];
 			for (const colKey of Object.keys(entry)) {
 				const colValue = entry[colKey as keyof typeof entry];
-				result[colKey] = is(colValue, SQL) ? colValue : new Param(colValue, cols[colKey]);
+				result[colKey] = is(colValue, SQL) ? colValue : new Param(colValue as any, cols[colKey]);
 			}
 			return result;
 		});
@@ -272,8 +275,7 @@ export class SingleStoreInsertBase<
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 
 	prepare(): SingleStoreInsertPrepare<this, TReturning> {

@@ -2,7 +2,7 @@ import type { CacheConfig, WithCacheConfig } from '~/cache/core/types.ts';
 import { entityKind, is } from '~/entity.ts';
 import type { PgColumn } from '~/pg-core/columns/index.ts';
 import type { PgDialect } from '~/pg-core/dialect.ts';
-import type { PgSession, PreparedQueryConfig } from '~/pg-core/session.ts';
+import type { PgSession } from '~/pg-core/session.ts';
 import type { SubqueryWithSelection } from '~/pg-core/subquery.ts';
 import type { PgTable } from '~/pg-core/table.ts';
 import { PgViewBase } from '~/pg-core/view-base.ts';
@@ -17,39 +17,35 @@ import type {
 	SelectResult,
 	SetOperator,
 } from '~/query-builders/select.types.ts';
-import { QueryPromise } from '~/query-promise.ts';
-import type { RunnableQuery } from '~/runnable-query.ts';
 import { SelectionProxyHandler } from '~/selection-proxy.ts';
-import { SQL, View } from '~/sql/sql.ts';
-import type { ColumnsSelection, Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
+import { SQL, sql, View } from '~/sql/sql.ts';
+import type { ColumnsSelection, CommentInput, Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
 import { Subquery } from '~/subquery.ts';
 import { Table } from '~/table.ts';
-import { tracer } from '~/tracing.ts';
 import {
-	applyMixins,
+	type Assume,
 	type DrizzleTypeError,
 	getTableColumns,
 	getTableLikeName,
 	haveSameKeys,
-	type NeonAuthToken,
+	orderSelectedFields,
 	type ValueOrArray,
 } from '~/utils.ts';
-import { orderSelectedFields } from '~/utils.ts';
 import { ViewBaseConfig } from '~/view-common.ts';
 import { extractUsedTable } from '../utils.ts';
 import type {
-	AnyPgSelect,
-	CreatePgSelectFromBuilderMode,
+	AnyPgSelectQueryBuilder,
 	GetPgSetOperators,
 	LockConfig,
 	LockStrength,
 	PgCreateSetOperatorFn,
 	PgSelectConfig,
+	PgSelectCrossJoinFn,
 	PgSelectDynamic,
-	PgSelectHKT,
 	PgSelectHKTBase,
 	PgSelectJoinFn,
-	PgSelectPrepare,
+	PgSelectKind,
+	PgSelectQueryBuilderHKT as PgSelectHKT,
 	PgSelectWithout,
 	PgSetOperatorExcludedMethods,
 	PgSetOperatorWithResult,
@@ -58,9 +54,24 @@ import type {
 	TableLikeHasEmptySelection,
 } from './select.types.ts';
 
+export interface PgSelectBuilderConstructor {
+	new(
+		config: {
+			table: PgSelectConfig['table'];
+			fields: PgSelectConfig['fields'];
+			isPartialSelect: boolean;
+			session: PgSession | undefined;
+			dialect: PgDialect;
+			withList: Subquery[];
+			distinct: boolean | { on: (PgColumn | SQLWrapper)[] } | undefined;
+			tagged?: boolean;
+		},
+	): AnyPgSelectQueryBuilder;
+}
+
 export class PgSelectBuilder<
 	TSelection extends SelectedFields | undefined,
-	TBuilderMode extends 'db' | 'qb' = 'db',
+	THKT extends PgSelectHKTBase = PgSelectHKT,
 > {
 	static readonly [entityKind]: string = 'PgSelectBuilder';
 
@@ -68,9 +79,8 @@ export class PgSelectBuilder<
 	private session: PgSession | undefined;
 	private dialect: PgDialect;
 	private withList: Subquery[] = [];
-	private distinct: boolean | {
-		on: (PgColumn | SQLWrapper)[];
-	} | undefined;
+	private distinct: boolean | { on: (PgColumn | SQLWrapper)[] } | undefined;
+	private tagged: boolean | undefined;
 
 	constructor(
 		config: {
@@ -78,10 +88,10 @@ export class PgSelectBuilder<
 			session: PgSession | undefined;
 			dialect: PgDialect;
 			withList?: Subquery[];
-			distinct?: boolean | {
-				on: (PgColumn | SQLWrapper)[];
-			};
+			distinct?: boolean | { on: (PgColumn | SQLWrapper)[] };
+			tagged?: boolean;
 		},
+		private builder: PgSelectBuilderConstructor = PgSelectBase as unknown as PgSelectBuilderConstructor,
 	) {
 		this.fields = config.fields;
 		this.session = config.session;
@@ -90,13 +100,7 @@ export class PgSelectBuilder<
 			this.withList = config.withList;
 		}
 		this.distinct = config.distinct;
-	}
-
-	private authToken?: NeonAuthToken;
-	/** @internal */
-	setToken(token?: NeonAuthToken) {
-		this.authToken = token;
-		return this;
+		// this.tagged = config.tagged; // TODO: bugged, to be remade
 	}
 
 	/**
@@ -105,23 +109,34 @@ export class PgSelectBuilder<
 	 *
 	 * {@link https://www.postgresql.org/docs/current/sql-select.html#SQL-FROM | Postgres from documentation}
 	 */
-	from<TFrom extends PgTable | Subquery | PgViewBase | SQL>(
+	from<
+		TFrom extends PgTable | Subquery | PgViewBase | SQL,
+		TConfig extends Record<string, any> = {
+			tableName: GetSelectTableName<TFrom>;
+			selection: TSelection extends undefined ? GetSelectTableSelection<TFrom> : TSelection;
+			selectMode: TSelection extends undefined ? 'single' : 'partial';
+			nullabilityMap: GetSelectTableName<TFrom> extends string ? Record<GetSelectTableName<TFrom>, 'not-null'> : {};
+		},
+	>(
 		source: TableLikeHasEmptySelection<TFrom> extends true ? DrizzleTypeError<
 				"Cannot reference a data-modifying statement subquery if it doesn't contain a `returning` clause"
 			>
 			: TFrom,
-	): CreatePgSelectFromBuilderMode<
-		TBuilderMode,
-		GetSelectTableName<TFrom>,
-		TSelection extends undefined ? GetSelectTableSelection<TFrom> : TSelection,
-		TSelection extends undefined ? 'single' : 'partial'
+	): PgSelectKind<
+		THKT,
+		TConfig['tableName'],
+		TConfig['selection'],
+		TConfig['selectMode'],
+		TConfig['tableName'] extends string ? Record<TConfig['tableName'], 'not-null'> : {},
+		false,
+		never
 	> {
 		const isPartialSelect = !!this.fields;
 		const src = source as TFrom;
 
 		let fields: SelectedFields;
 		if (this.fields) {
-			fields = this.fields;
+			fields = this.fields as SelectedFields;
 		} else if (is(src, Subquery)) {
 			// This is required to use the proxy handler to get the correct field values from the subquery
 			fields = Object.fromEntries(
@@ -137,7 +152,7 @@ export class PgSelectBuilder<
 			fields = getTableColumns<PgTable>(src);
 		}
 
-		return (new PgSelectBase({
+		return new this.builder({
 			table: src,
 			fields,
 			isPartialSelect,
@@ -145,21 +160,60 @@ export class PgSelectBuilder<
 			dialect: this.dialect,
 			withList: this.withList,
 			distinct: this.distinct,
-		}).setToken(this.authToken)) as any;
+			// tagged: this.tagged,  // TODO: bugged, to be remade
+		}) as any;
 	}
 }
 
-export abstract class PgSelectQueryBuilderBase<
+export type PgSelect<
+	TTableName extends string | undefined = string | undefined,
+	TSelection extends ColumnsSelection = Record<string, any>,
+	TSelectMode extends SelectMode = SelectMode,
+	TNullabilityMap extends Record<string, JoinNullability> = Record<string, JoinNullability>,
+> = PgSelectBase<
+	PgSelectHKT,
+	TTableName,
+	TSelection,
+	TSelectMode,
+	TNullabilityMap,
+	true,
+	never
+>;
+
+export type PgSelectQueryBuilder<
+	THKT extends PgSelectHKTBase = PgSelectHKT,
+	TTableName extends string | undefined = string | undefined,
+	TSelection extends ColumnsSelection = ColumnsSelection,
+	TSelectMode extends SelectMode = SelectMode,
+	TNullabilityMap extends Record<string, JoinNullability> = Record<string, JoinNullability>,
+	TResult extends any[] = unknown[],
+	TSelectedFields extends ColumnsSelection = ColumnsSelection,
+> = PgSelectBase<
+	THKT,
+	TTableName,
+	TSelection,
+	TSelectMode,
+	TNullabilityMap,
+	true,
+	never,
+	TResult,
+	TSelectedFields
+>;
+
+export class PgSelectBase<
 	THKT extends PgSelectHKTBase,
 	TTableName extends string | undefined,
-	TSelection extends ColumnsSelection,
+	TSelection extends ColumnsSelection | undefined,
 	TSelectMode extends SelectMode,
 	TNullabilityMap extends Record<string, JoinNullability> = TTableName extends string ? Record<TTableName, 'not-null'>
 		: {},
 	TDynamic extends boolean = false,
 	TExcludedMethods extends string = never,
 	TResult extends any[] = SelectResult<TSelection, TSelectMode, TNullabilityMap>[],
-	TSelectedFields extends ColumnsSelection = BuildSubquerySelection<TSelection, TNullabilityMap>,
+	TSelectedFields extends ColumnsSelection = BuildSubquerySelection<
+		Assume<TSelection, ColumnsSelection>,
+		TNullabilityMap
+	>,
 > extends TypedQueryBuilder<TSelectedFields, TResult> {
 	static override readonly [entityKind]: string = 'PgSelectQueryBuilder';
 
@@ -180,44 +234,49 @@ export abstract class PgSelectQueryBuilderBase<
 	protected config: PgSelectConfig;
 	protected joinsNotNullableMap: Record<string, boolean>;
 	protected tableName: string | undefined;
-	private isPartialSelect: boolean;
+	protected isPartialSelect: boolean;
 	protected session: PgSession | undefined;
 	protected dialect: PgDialect;
-	protected cacheConfig?: WithCacheConfig = undefined;
+	protected cacheConfig?: WithCacheConfig;
 	protected usedTables: Set<string> = new Set();
 
 	constructor(
-		{ table, fields, isPartialSelect, session, dialect, withList, distinct }: {
+		config: {
 			table: PgSelectConfig['table'];
 			fields: PgSelectConfig['fields'];
 			isPartialSelect: boolean;
 			session: PgSession | undefined;
 			dialect: PgDialect;
 			withList: Subquery[];
-			distinct: boolean | {
-				on: (PgColumn | SQLWrapper)[];
-			} | undefined;
+			distinct: boolean | { on: (PgColumn | SQLWrapper)[] } | undefined;
+			tagged?: boolean;
 		},
 	) {
 		super();
+		this.session = config.session;
+		this.dialect = config.dialect;
 		this.config = {
-			withList,
-			table,
-			fields: { ...fields },
-			distinct,
+			withList: config.withList,
+			table: config.table,
+			fields: { ...config.fields },
+			distinct: config.distinct,
 			setOperators: [],
+			// tagged: config.tagged, // TODO: bugged, to be remade
 		};
-		this.isPartialSelect = isPartialSelect;
-		this.session = session;
-		this.dialect = dialect;
+		this.isPartialSelect = config.isPartialSelect;
 		this._ = {
-			selectedFields: fields as TSelectedFields,
+			selectedFields: this.config.fields as TSelectedFields,
 			config: this.config,
 		} as this['_'];
-		this.tableName = getTableLikeName(table);
+		this.tableName = getTableLikeName(config.table);
 		this.joinsNotNullableMap = typeof this.tableName === 'string' ? { [this.tableName]: true } : {};
 
-		for (const item of extractUsedTable(table)) this.usedTables.add(item);
+		for (const item of extractUsedTable(config.table)) this.usedTables.add(item);
+
+		this.config.withList?.forEach((it) => {
+			const extracted = extractUsedTable(it);
+			for (const el of extracted) this.usedTables.add(el);
+		});
 	}
 
 	/** @internal */
@@ -231,7 +290,9 @@ export abstract class PgSelectQueryBuilderBase<
 	>(
 		joinType: TJoinType,
 		lateral: TIsLateral,
-	): PgSelectJoinFn<this, TDynamic, TJoinType, TIsLateral> {
+	): 'cross' extends TJoinType ? PgSelectCrossJoinFn<this, TDynamic, TIsLateral>
+		: PgSelectJoinFn<this, TDynamic, TJoinType, TIsLateral>
+	{
 		return ((
 			table: TIsLateral extends true ? Subquery | SQL : PgTable | Subquery | PgViewBase | SQL,
 			on?: ((aliases: TSelection) => SQL | undefined) | SQL | undefined,
@@ -978,14 +1039,21 @@ export abstract class PgSelectQueryBuilderBase<
 		return this as any;
 	}
 
-	/** @internal */
+	/**
+	 * Attach [sqlcommenter](https://google.github.io/sqlcommenter) comment to a query
+	 */
+	comment(comment: CommentInput): PgSelectWithout<this, TDynamic, 'comment'> {
+		this.config.comment = sql.comment(comment);
+		return this as any;
+	}
+
 	getSQL(): SQL {
+		this.config.fieldsFlat = orderSelectedFields<PgColumn>(this.config.fields, undefined, this.dialect.codecs);
 		return this.dialect.buildSelectQuery(this.config);
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 	as<TAlias extends string>(
 		alias: TAlias,
@@ -995,7 +1063,9 @@ export abstract class PgSelectQueryBuilderBase<
 		if (this.config.joins) { for (const it of this.config.joins) usedTables.push(...extractUsedTable(it.table)); }
 
 		return new Proxy(
-			new Subquery(this.getSQL(), this.config.fields, alias, false, [...new Set(usedTables)]),
+			new Subquery(this.withoutSelectionCastCodecs().getSQL(), this.config.fields, alias, false, [
+				...new Set(usedTables),
+			]),
 			new SelectionProxyHandler({ alias, sqlAliasedBehavior: 'alias', sqlBehavior: 'error' }),
 		) as SubqueryWithSelection<this['_']['selectedFields'], TAlias>;
 	}
@@ -1008,125 +1078,32 @@ export abstract class PgSelectQueryBuilderBase<
 		) as this['_']['selectedFields'];
 	}
 
+	/** @internal */
+	override withoutSelectionCastCodecs(): this {
+		this.config.ignoreSelectionCastCodecs = true;
+		return this;
+	}
+
 	$dynamic(): PgSelectDynamic<this> {
 		return this;
 	}
 
 	$withCache(config?: { config?: CacheConfig; tag?: string; autoInvalidate?: boolean } | false) {
 		this.cacheConfig = config === undefined
-			? { config: {}, enable: true, autoInvalidate: true }
+			? { config: {}, enabled: true, autoInvalidate: true }
 			: config === false
-			? { enable: false }
-			: { enable: true, autoInvalidate: true, ...config };
+			? { enabled: false }
+			: { enabled: true, autoInvalidate: true, ...config };
 		return this;
 	}
 }
-
-export interface PgSelectBase<
-	TTableName extends string | undefined,
-	TSelection extends ColumnsSelection,
-	TSelectMode extends SelectMode,
-	TNullabilityMap extends Record<string, JoinNullability> = TTableName extends string ? Record<TTableName, 'not-null'>
-		: {},
-	TDynamic extends boolean = false,
-	TExcludedMethods extends string = never,
-	TResult extends any[] = SelectResult<TSelection, TSelectMode, TNullabilityMap>[],
-	TSelectedFields extends ColumnsSelection = BuildSubquerySelection<TSelection, TNullabilityMap>,
-> extends
-	PgSelectQueryBuilderBase<
-		PgSelectHKT,
-		TTableName,
-		TSelection,
-		TSelectMode,
-		TNullabilityMap,
-		TDynamic,
-		TExcludedMethods,
-		TResult,
-		TSelectedFields
-	>,
-	QueryPromise<TResult>,
-	SQLWrapper
-{}
-
-export class PgSelectBase<
-	TTableName extends string | undefined,
-	TSelection extends ColumnsSelection,
-	TSelectMode extends SelectMode,
-	TNullabilityMap extends Record<string, JoinNullability> = TTableName extends string ? Record<TTableName, 'not-null'>
-		: {},
-	TDynamic extends boolean = false,
-	TExcludedMethods extends string = never,
-	TResult = SelectResult<TSelection, TSelectMode, TNullabilityMap>[],
-	TSelectedFields = BuildSubquerySelection<TSelection, TNullabilityMap>,
-> extends PgSelectQueryBuilderBase<
-	PgSelectHKT,
-	TTableName,
-	TSelection,
-	TSelectMode,
-	TNullabilityMap,
-	TDynamic,
-	TExcludedMethods,
-	TResult,
-	TSelectedFields
-> implements RunnableQuery<TResult, 'pg'>, SQLWrapper {
-	static override readonly [entityKind]: string = 'PgSelect';
-
-	/** @internal */
-	_prepare(name?: string): PgSelectPrepare<this> {
-		const { session, config, dialect, joinsNotNullableMap, authToken, cacheConfig, usedTables } = this;
-		if (!session) {
-			throw new Error('Cannot execute a query on a query builder. Please use a database instance instead.');
-		}
-
-		const { fields } = config;
-
-		return tracer.startActiveSpan('drizzle.prepareQuery', () => {
-			const fieldsList = orderSelectedFields<PgColumn>(fields);
-			const query = session.prepareQuery<
-				PreparedQueryConfig & { execute: TResult }
-			>(dialect.sqlToQuery(this.getSQL()), fieldsList, name, true, undefined, {
-				type: 'select',
-				tables: [...usedTables],
-			}, cacheConfig);
-			query.joinsNotNullableMap = joinsNotNullableMap;
-
-			return query.setToken(authToken);
-		});
-	}
-
-	/**
-	 * Create a prepared statement for this query. This allows
-	 * the database to remember this query for the given session
-	 * and call it by name, rather than specifying the full query.
-	 *
-	 * {@link https://www.postgresql.org/docs/current/sql-prepare.html | Postgres prepare documentation}
-	 */
-	prepare(name: string): PgSelectPrepare<this> {
-		return this._prepare(name);
-	}
-
-	private authToken?: NeonAuthToken;
-	/** @internal */
-	setToken(token?: NeonAuthToken) {
-		this.authToken = token;
-		return this;
-	}
-
-	execute: ReturnType<this['prepare']>['execute'] = (placeholderValues) => {
-		return tracer.startActiveSpan('drizzle.operation', () => {
-			return this._prepare().execute(placeholderValues, this.authToken);
-		});
-	};
-}
-
-applyMixins(PgSelectBase, [QueryPromise]);
 
 function createSetOperator(type: SetOperator, isAll: boolean): PgCreateSetOperatorFn {
 	return (leftSelect, rightSelect, ...restSelects) => {
 		const setOperators = [rightSelect, ...restSelects].map((select) => ({
 			type,
 			isAll,
-			rightSelect: select as AnyPgSelect,
+			rightSelect: select as AnyPgSelectQueryBuilder,
 		}));
 
 		for (const setOperator of setOperators) {
@@ -1137,7 +1114,7 @@ function createSetOperator(type: SetOperator, isAll: boolean): PgCreateSetOperat
 			}
 		}
 
-		return (leftSelect as AnyPgSelect).addSetOperators(setOperators) as any;
+		return (leftSelect as AnyPgSelectQueryBuilder).addSetOperators(setOperators) as any;
 	};
 }
 

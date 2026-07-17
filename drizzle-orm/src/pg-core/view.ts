@@ -1,4 +1,4 @@
-import type { BuildColumns } from '~/column-builder.ts';
+import type { Casing } from '~/casing.ts';
 import { entityKind, is } from '~/entity.ts';
 import type { TypedQueryBuilder } from '~/query-builders/query-builder.ts';
 import type { AddAliasToSelection } from '~/query-builders/select.types.ts';
@@ -6,11 +6,11 @@ import { SelectionProxyHandler } from '~/selection-proxy.ts';
 import type { ColumnsSelection, SQL } from '~/sql/sql.ts';
 import { getTableColumns } from '~/utils.ts';
 import type { RequireAtLeastOne } from '~/utils.ts';
-import type { PgColumn, PgColumnBuilderBase } from './columns/common.ts';
+import type { AnyPgColumnBuilder, PgBuildColumns, PgColumn } from './columns/common.ts';
 import { QueryBuilder } from './query-builders/query-builder.ts';
-import { pgTable } from './table.ts';
+import { pgTableWithSchema } from './table.ts';
 import { PgViewBase } from './view-base.ts';
-import { PgViewConfig } from './view-common.ts';
+import { PgMaterializedViewConfig, PgViewConfig } from './view-common.ts';
 
 export type ViewWithConfig = RequireAtLeastOne<{
 	checkOption: 'local' | 'cascaded';
@@ -64,7 +64,7 @@ export class ViewBuilder<TName extends string = string> extends DefaultViewBuild
 					name: this.name,
 					schema: this.schema,
 					selectedFields: aliasedSelection,
-					query: qb.getSQL().inlineParams(),
+					query: qb.withoutSelectionCastCodecs().getSQL().inlineParams(),
 				},
 			}),
 			selectionProxy as any,
@@ -74,7 +74,7 @@ export class ViewBuilder<TName extends string = string> extends DefaultViewBuild
 
 export class ManualViewBuilder<
 	TName extends string = string,
-	TColumns extends Record<string, PgColumnBuilderBase> = Record<string, PgColumnBuilderBase>,
+	TColumns extends Record<string, AnyPgColumnBuilder> = Record<string, AnyPgColumnBuilder>,
 > extends DefaultViewBuilderCore<{ name: TName; columns: TColumns }> {
 	static override readonly [entityKind]: string = 'PgManualViewBuilder';
 
@@ -84,12 +84,13 @@ export class ManualViewBuilder<
 		name: TName,
 		columns: TColumns,
 		schema: string | undefined,
+		casing: Casing | undefined,
 	) {
 		super(name, schema);
-		this.columns = getTableColumns(pgTable(name, columns));
+		this.columns = getTableColumns(pgTableWithSchema(name, columns, undefined, schema, casing));
 	}
 
-	existing(): PgViewWithSelection<TName, true, BuildColumns<TName, TColumns, 'pg'>> {
+	existing(): PgViewWithSelection<TName, true, PgBuildColumns<TName, TColumns>> {
 		return new Proxy(
 			new PgView({
 				pgConfig: undefined,
@@ -106,10 +107,10 @@ export class ManualViewBuilder<
 				sqlAliasedBehavior: 'alias',
 				replaceOriginalName: true,
 			}),
-		) as PgViewWithSelection<TName, true, BuildColumns<TName, TColumns, 'pg'>>;
+		) as PgViewWithSelection<TName, true, PgBuildColumns<TName, TColumns>>;
 	}
 
-	as(query: SQL): PgViewWithSelection<TName, false, BuildColumns<TName, TColumns, 'pg'>> {
+	as(query: SQL): PgViewWithSelection<TName, false, PgBuildColumns<TName, TColumns>> {
 		return new Proxy(
 			new PgView({
 				pgConfig: this.config,
@@ -126,7 +127,7 @@ export class ManualViewBuilder<
 				sqlAliasedBehavior: 'alias',
 				replaceOriginalName: true,
 			}),
-		) as PgViewWithSelection<TName, false, BuildColumns<TName, TColumns, 'pg'>>;
+		) as PgViewWithSelection<TName, false, PgBuildColumns<TName, TColumns>>;
 	}
 }
 
@@ -222,7 +223,7 @@ export class MaterializedViewBuilder<TName extends string = string>
 					name: this.name,
 					schema: this.schema,
 					selectedFields: aliasedSelection,
-					query: qb.getSQL().inlineParams(),
+					query: qb.withoutSelectionCastCodecs().getSQL().inlineParams(),
 				},
 			}),
 			selectionProxy as any,
@@ -232,7 +233,7 @@ export class MaterializedViewBuilder<TName extends string = string>
 
 export class ManualMaterializedViewBuilder<
 	TName extends string = string,
-	TColumns extends Record<string, PgColumnBuilderBase> = Record<string, PgColumnBuilderBase>,
+	TColumns extends Record<string, AnyPgColumnBuilder> = Record<string, AnyPgColumnBuilder>,
 > extends MaterializedViewBuilderCore<{ name: TName; columns: TColumns }> {
 	static override readonly [entityKind]: string = 'PgManualMaterializedViewBuilder';
 
@@ -242,12 +243,13 @@ export class ManualMaterializedViewBuilder<
 		name: TName,
 		columns: TColumns,
 		schema: string | undefined,
+		casing: Casing | undefined,
 	) {
 		super(name, schema);
-		this.columns = getTableColumns(pgTable(name, columns));
+		this.columns = getTableColumns(pgTableWithSchema(name, columns, undefined, schema, casing));
 	}
 
-	existing(): PgMaterializedViewWithSelection<TName, true, BuildColumns<TName, TColumns, 'pg'>> {
+	existing(): PgMaterializedViewWithSelection<TName, true, PgBuildColumns<TName, TColumns>> {
 		return new Proxy(
 			new PgMaterializedView({
 				pgConfig: {
@@ -269,10 +271,10 @@ export class ManualMaterializedViewBuilder<
 				sqlAliasedBehavior: 'alias',
 				replaceOriginalName: true,
 			}),
-		) as PgMaterializedViewWithSelection<TName, true, BuildColumns<TName, TColumns, 'pg'>>;
+		) as PgMaterializedViewWithSelection<TName, true, PgBuildColumns<TName, TColumns>>;
 	}
 
-	as(query: SQL): PgMaterializedViewWithSelection<TName, false, BuildColumns<TName, TColumns, 'pg'>> {
+	as(query: SQL): PgMaterializedViewWithSelection<TName, false, PgBuildColumns<TName, TColumns>> {
 		return new Proxy(
 			new PgMaterializedView({
 				pgConfig: {
@@ -294,7 +296,7 @@ export class ManualMaterializedViewBuilder<
 				sqlAliasedBehavior: 'alias',
 				replaceOriginalName: true,
 			}),
-		) as PgMaterializedViewWithSelection<TName, false, BuildColumns<TName, TColumns, 'pg'>>;
+		) as PgMaterializedViewWithSelection<TName, false, PgBuildColumns<TName, TColumns>>;
 	}
 }
 
@@ -334,8 +336,6 @@ export type PgViewWithSelection<
 	TExisting extends boolean = boolean,
 	TSelectedFields extends ColumnsSelection = ColumnsSelection,
 > = PgView<TName, TExisting, TSelectedFields> & TSelectedFields;
-
-export const PgMaterializedViewConfig = Symbol.for('drizzle:PgMaterializedViewConfig');
 
 export class PgMaterializedView<
 	TName extends string = string,
@@ -384,11 +384,12 @@ export type PgMaterializedViewWithSelection<
 /** @internal */
 export function pgViewWithSchema(
 	name: string,
-	selection: Record<string, PgColumnBuilderBase> | undefined,
+	selection: Record<string, AnyPgColumnBuilder> | undefined,
 	schema: string | undefined,
+	casing: Casing | undefined,
 ): ViewBuilder | ManualViewBuilder {
 	if (selection) {
-		return new ManualViewBuilder(name, selection, schema);
+		return new ManualViewBuilder(name, selection, schema, casing);
 	}
 	return new ViewBuilder(name, schema);
 }
@@ -396,35 +397,45 @@ export function pgViewWithSchema(
 /** @internal */
 export function pgMaterializedViewWithSchema(
 	name: string,
-	selection: Record<string, PgColumnBuilderBase> | undefined,
+	selection: Record<string, AnyPgColumnBuilder> | undefined,
 	schema: string | undefined,
+	casing: Casing | undefined,
 ): MaterializedViewBuilder | ManualMaterializedViewBuilder {
 	if (selection) {
-		return new ManualMaterializedViewBuilder(name, selection, schema);
+		return new ManualMaterializedViewBuilder(name, selection, schema, casing);
 	}
 	return new MaterializedViewBuilder(name, schema);
 }
 
-export function pgView<TName extends string>(name: TName): ViewBuilder<TName>;
-export function pgView<TName extends string, TColumns extends Record<string, PgColumnBuilderBase>>(
-	name: TName,
-	columns: TColumns,
-): ManualViewBuilder<TName, TColumns>;
-export function pgView(name: string, columns?: Record<string, PgColumnBuilderBase>): ViewBuilder | ManualViewBuilder {
-	return pgViewWithSchema(name, columns, undefined);
+export interface PgViewFn {
+	<TName extends string>(name: TName): ViewBuilder<TName>;
+	<TName extends string, TColumns extends Record<string, AnyPgColumnBuilder>>(
+		name: TName,
+		columns: TColumns,
+	): ManualViewBuilder<TName, TColumns>;
 }
 
-export function pgMaterializedView<TName extends string>(name: TName): MaterializedViewBuilder<TName>;
-export function pgMaterializedView<TName extends string, TColumns extends Record<string, PgColumnBuilderBase>>(
-	name: TName,
-	columns: TColumns,
-): ManualMaterializedViewBuilder<TName, TColumns>;
-export function pgMaterializedView(
-	name: string,
-	columns?: Record<string, PgColumnBuilderBase>,
-): MaterializedViewBuilder | ManualMaterializedViewBuilder {
-	return pgMaterializedViewWithSchema(name, columns, undefined);
+export interface PgMaterializedViewFn {
+	<TName extends string>(name: TName): MaterializedViewBuilder<TName>;
+	<TName extends string, TColumns extends Record<string, AnyPgColumnBuilder>>(
+		name: TName,
+		columns: TColumns,
+	): ManualMaterializedViewBuilder<TName, TColumns>;
 }
+
+/** @internal */
+export function pgViewWithCasing(casing: Casing | undefined): PgViewFn {
+	return ((name, columns) => pgViewWithSchema(name, columns, undefined, casing)) as PgViewFn;
+}
+
+/** @internal */
+export function pgMaterializedViewWithCasing(casing: Casing | undefined): PgMaterializedViewFn {
+	return ((name, columns) => pgMaterializedViewWithSchema(name, columns, undefined, casing)) as PgMaterializedViewFn;
+}
+
+export const pgView = pgViewWithCasing(undefined);
+
+export const pgMaterializedView = pgMaterializedViewWithCasing(undefined);
 
 export function isPgView(obj: unknown): obj is PgView {
 	return is(obj, PgView);

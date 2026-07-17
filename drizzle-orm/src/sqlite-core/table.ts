@@ -1,9 +1,15 @@
-import type { BuildColumns, BuildExtraConfigColumns } from '~/column-builder.ts';
+import { type Casing, getCasingFn } from '~/casing.ts';
+import type { BuildColumns, BuildExtraConfigColumns, ColumnBuilderBase } from '~/column-builder.ts';
 import { entityKind } from '~/entity.ts';
-import { Table, type TableConfig as TableConfigBase, type UpdateTableConfig } from '~/table.ts';
+import {
+	type InferTableColumnsModels,
+	Table,
+	type TableConfig as TableConfigBase,
+	type UpdateTableConfig,
+} from '~/table.ts';
 import type { CheckBuilder } from './checks.ts';
 import { getSQLiteColumnBuilders, type SQLiteColumnBuilders } from './columns/all.ts';
-import type { SQLiteColumn, SQLiteColumnBuilder, SQLiteColumnBuilderBase } from './columns/common.ts';
+import type { SQLiteColumn, SQLiteColumnBuilder, SQLiteColumns } from './columns/common.ts';
 import type { ForeignKey, ForeignKeyBuilder } from './foreign-keys.ts';
 import type { IndexBuilder } from './indexes.ts';
 import type { PrimaryKeyBuilder } from './primary-keys.ts';
@@ -21,7 +27,7 @@ export type SQLiteTableExtraConfig = Record<
 	SQLiteTableExtraConfigValue
 >;
 
-export type TableConfig = TableConfigBase<SQLiteColumn<any>>;
+export type TableConfig = TableConfigBase<SQLiteColumns>;
 
 /** @internal */
 export const InlineForeignKeys = Symbol.for('drizzle:SQLiteInlineForeignKeys');
@@ -52,14 +58,13 @@ export type AnySQLiteTable<TPartial extends Partial<TableConfig> = {}> = SQLiteT
 
 export type SQLiteTableWithColumns<T extends TableConfig> =
 	& SQLiteTable<T>
-	& {
-		[Key in keyof T['columns']]: T['columns'][Key];
-	};
+	& T['columns']
+	& InferTableColumnsModels<T['columns']>;
 
 export interface SQLiteTableFn<TSchema extends string | undefined = undefined> {
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, SQLiteColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: TColumnsMap,
@@ -75,7 +80,7 @@ export interface SQLiteTableFn<TSchema extends string | undefined = undefined> {
 
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, SQLiteColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: (columnTypes: SQLiteColumnBuilders) => TColumnsMap,
@@ -110,7 +115,7 @@ export interface SQLiteTableFn<TSchema extends string | undefined = undefined> {
 	 */
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, SQLiteColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: TColumnsMap,
@@ -146,7 +151,7 @@ export interface SQLiteTableFn<TSchema extends string | undefined = undefined> {
 	 */
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, SQLiteColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: (columnTypes: SQLiteColumnBuilders) => TColumnsMap,
@@ -159,9 +164,10 @@ export interface SQLiteTableFn<TSchema extends string | undefined = undefined> {
 	}>;
 }
 
-function sqliteTableBase<
+/** @internal */
+export function sqliteTableBase<
 	TTableName extends string,
-	TColumnsMap extends Record<string, SQLiteColumnBuilderBase>,
+	TColumnsMap extends Record<string, ColumnBuilderBase>,
 	TSchema extends string | undefined,
 >(
 	name: TTableName,
@@ -171,7 +177,8 @@ function sqliteTableBase<
 			self: BuildColumns<TTableName, TColumnsMap, 'sqlite'>,
 		) => SQLiteTableExtraConfig | SQLiteTableExtraConfigValue[])
 		| undefined,
-	schema?: TSchema,
+	schema: TSchema | undefined,
+	casing: Casing | undefined,
 	baseName = name,
 ): SQLiteTableWithColumns<{
 	name: TTableName;
@@ -179,6 +186,7 @@ function sqliteTableBase<
 	columns: BuildColumns<TTableName, TColumnsMap, 'sqlite'>;
 	dialect: 'sqlite';
 }> {
+	const casingFn = getCasingFn(casing);
 	const rawTable = new SQLiteTable<{
 		name: TTableName;
 		schema: TSchema;
@@ -191,8 +199,8 @@ function sqliteTableBase<
 	const builtColumns = Object.fromEntries(
 		Object.entries(parsedColumns).map(([name, colBuilderBase]) => {
 			const colBuilder = colBuilderBase as SQLiteColumnBuilder;
-			colBuilder.setName(name);
-			const column = colBuilder.build(rawTable);
+			colBuilder.setName(name, casingFn);
+			const column = colBuilder.build(rawTable).postBuild();
 			rawTable[InlineForeignKeys].push(...colBuilder.buildForeignKeys(column, rawTable));
 			return [name, column];
 		}),
@@ -213,15 +221,21 @@ function sqliteTableBase<
 		) => SQLiteTableExtraConfig;
 	}
 
-	return table;
+	return table as any;
 }
 
-export const sqliteTable: SQLiteTableFn = (name, columns, extraConfig) => {
-	return sqliteTableBase(name, columns, extraConfig);
-};
+/** @internal */
+export function sqliteTableWithCasing(casing: Casing | undefined): SQLiteTableFn {
+	return (name, columns, extraConfig) => sqliteTableBase(name, columns, extraConfig, undefined, casing);
+}
 
-export function sqliteTableCreator(customizeTableName: (name: string) => string): SQLiteTableFn {
+export const sqliteTable = sqliteTableWithCasing(undefined);
+
+export function sqliteTableCreator(
+	customizeTableName: (name: string) => string,
+	casing?: Casing | undefined,
+): SQLiteTableFn {
 	return (name, columns, extraConfig) => {
-		return sqliteTableBase(customizeTableName(name) as typeof name, columns, extraConfig, undefined, name);
+		return sqliteTableBase(customizeTableName(name) as typeof name, columns, extraConfig, undefined, casing, name);
 	};
 }

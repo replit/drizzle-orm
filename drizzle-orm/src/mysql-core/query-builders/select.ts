@@ -2,7 +2,7 @@ import type { CacheConfig, WithCacheConfig } from '~/cache/core/types.ts';
 import { entityKind, is } from '~/entity.ts';
 import type { MySqlColumn } from '~/mysql-core/columns/index.ts';
 import type { MySqlDialect } from '~/mysql-core/dialect.ts';
-import type { MySqlPreparedQueryConfig, MySqlSession, PreparedQueryHKTBase } from '~/mysql-core/session.ts';
+import type { MySqlSession } from '~/mysql-core/session.ts';
 import type { SubqueryWithSelection } from '~/mysql-core/subquery.ts';
 import { MySqlTable } from '~/mysql-core/table.ts';
 import { TypedQueryBuilder } from '~/query-builders/query-builder.ts';
@@ -15,32 +15,32 @@ import type {
 	SelectResult,
 	SetOperator,
 } from '~/query-builders/select.types.ts';
-import { QueryPromise } from '~/query-promise.ts';
 import { SelectionProxyHandler } from '~/selection-proxy.ts';
-import type { ColumnsSelection, Placeholder, Query } from '~/sql/sql.ts';
-import { SQL, View } from '~/sql/sql.ts';
+import type { ColumnsSelection, CommentInput, Placeholder, Query } from '~/sql/sql.ts';
+import { SQL, sql, View } from '~/sql/sql.ts';
 import { Subquery } from '~/subquery.ts';
 import { Table } from '~/table.ts';
 import type { ValueOrArray } from '~/utils.ts';
-import { applyMixins, getTableColumns, getTableLikeName, haveSameKeys, orderSelectedFields } from '~/utils.ts';
+import { getTableColumns, getTableLikeName, haveSameKeys, orderSelectedFields } from '~/utils.ts';
 import { ViewBaseConfig } from '~/view-common.ts';
 import type { IndexBuilder } from '../indexes.ts';
+import type { UniqueConstraintBuilder } from '../unique-constraint.ts';
 import { convertIndexToString, extractUsedTable, toArray } from '../utils.ts';
 import { MySqlViewBase } from '../view-base.ts';
 import type {
-	AnyMySqlSelect,
-	CreateMySqlSelectFromBuilderMode,
+	AnyMySqlSelectQueryBuilder,
 	GetMySqlSetOperators,
 	LockConfig,
 	LockStrength,
 	MySqlCreateSetOperatorFn,
+	MySqlCrossJoinFn,
 	MySqlJoinFn,
 	MySqlJoinType,
 	MySqlSelectConfig,
 	MySqlSelectDynamic,
-	MySqlSelectHKT,
 	MySqlSelectHKTBase,
-	MySqlSelectPrepare,
+	MySqlSelectKind,
+	MySqlSelectQueryBuilderHKT,
 	MySqlSelectWithout,
 	MySqlSetOperatorExcludedMethods,
 	MySqlSetOperatorWithResult,
@@ -48,7 +48,10 @@ import type {
 	SetOperatorRightSelect,
 } from './select.types.ts';
 
-export type IndexForHint = IndexBuilder | string;
+export type IndexForHint =
+	| IndexBuilder
+	| UniqueConstraintBuilder<string>
+	| string;
 
 export type IndexConfig = {
 	useIndex?: IndexForHint | IndexForHint[];
@@ -56,10 +59,26 @@ export type IndexConfig = {
 	ignoreIndex?: IndexForHint | IndexForHint[];
 };
 
+export interface MySqlSelectBuilderConstructor {
+	new(
+		config: {
+			table: MySqlSelectConfig['table'];
+			fields: MySqlSelectConfig['fields'];
+			isPartialSelect: boolean;
+			session: MySqlSession | undefined;
+			dialect: MySqlDialect;
+			withList: Subquery[];
+			distinct: boolean | undefined;
+			useIndex?: string[];
+			forceIndex?: string[];
+			ignoreIndex?: string[];
+		},
+	): AnyMySqlSelectQueryBuilder;
+}
+
 export class MySqlSelectBuilder<
 	TSelection extends SelectedFields | undefined,
-	TPreparedQueryHKT extends PreparedQueryHKTBase,
-	TBuilderMode extends 'db' | 'qb' = 'db',
+	THKT extends MySqlSelectHKTBase = MySqlSelectQueryBuilderHKT,
 > {
 	static readonly [entityKind]: string = 'MySqlSelectBuilder';
 
@@ -77,6 +96,7 @@ export class MySqlSelectBuilder<
 			withList?: Subquery[];
 			distinct?: boolean;
 		},
+		private builder: MySqlSelectBuilderConstructor = MySqlSelectBase as unknown as MySqlSelectBuilderConstructor,
 	) {
 		this.fields = config.fields;
 		this.session = config.session;
@@ -91,12 +111,14 @@ export class MySqlSelectBuilder<
 		source: TFrom,
 		onIndex?: TFrom extends MySqlTable ? IndexConfig
 			: 'Index hint configuration is allowed only for MySqlTable and not for subqueries or views',
-	): CreateMySqlSelectFromBuilderMode<
-		TBuilderMode,
+	): MySqlSelectKind<
+		THKT,
 		GetSelectTableName<TFrom>,
 		TSelection extends undefined ? GetSelectTableSelection<TFrom> : TSelection,
 		TSelection extends undefined ? 'single' : 'partial',
-		TPreparedQueryHKT
+		GetSelectTableName<TFrom> extends string ? Record<GetSelectTableName<TFrom>, 'not-null'> : {},
+		false,
+		never
 	> {
 		const isPartialSelect = !!this.fields;
 
@@ -133,7 +155,7 @@ export class MySqlSelectBuilder<
 			}
 		}
 
-		return new MySqlSelectBase(
+		return new this.builder(
 			{
 				table: source,
 				fields,
@@ -150,12 +172,26 @@ export class MySqlSelectBuilder<
 	}
 }
 
-export abstract class MySqlSelectQueryBuilderBase<
+export type MySqlSelect<
+	TTableName extends string | undefined = string | undefined,
+	TSelection extends ColumnsSelection = Record<string, any>,
+	TSelectMode extends SelectMode = SelectMode,
+	TNullabilityMap extends Record<string, JoinNullability> = Record<string, JoinNullability>,
+> = MySqlSelectBase<
+	MySqlSelectQueryBuilderHKT,
+	TTableName,
+	TSelection,
+	TSelectMode,
+	TNullabilityMap,
+	true,
+	never
+>;
+
+export class MySqlSelectBase<
 	THKT extends MySqlSelectHKTBase,
 	TTableName extends string | undefined,
 	TSelection extends ColumnsSelection,
 	TSelectMode extends SelectMode,
-	TPreparedQueryHKT extends PreparedQueryHKTBase,
 	TNullabilityMap extends Record<string, JoinNullability> = TTableName extends string ? Record<TTableName, 'not-null'>
 		: {},
 	TDynamic extends boolean = false,
@@ -170,7 +206,6 @@ export abstract class MySqlSelectQueryBuilderBase<
 		readonly tableName: TTableName;
 		readonly selection: TSelection;
 		readonly selectMode: TSelectMode;
-		readonly preparedQueryHKT: TPreparedQueryHKT;
 		readonly nullabilityMap: TNullabilityMap;
 		readonly dynamic: TDynamic;
 		readonly excludedMethods: TExcludedMethods;
@@ -237,7 +272,9 @@ export abstract class MySqlSelectQueryBuilderBase<
 	>(
 		joinType: TJoinType,
 		lateral: TIsLateral,
-	): MySqlJoinFn<this, TDynamic, TJoinType, TIsLateral> {
+	): 'cross' extends TJoinType ? MySqlCrossJoinFn<this, TDynamic, TIsLateral>
+		: MySqlJoinFn<this, TDynamic, TJoinType, TIsLateral>
+	{
 		return <
 			TJoinedTable extends MySqlTable | Subquery | MySqlViewBase | SQL,
 		>(
@@ -1025,14 +1062,21 @@ export abstract class MySqlSelectQueryBuilderBase<
 		return this as any;
 	}
 
-	/** @internal */
+	/**
+	 * Attach [sqlcommenter](https://google.github.io/sqlcommenter) comment to a query
+	 */
+	comment(comment: CommentInput): MySqlSelectWithout<this, TDynamic, 'comment'> {
+		this.config.comment = sql.comment(comment);
+		return this as any;
+	}
+
 	getSQL(): SQL {
+		this.config.fieldsFlat = orderSelectedFields<MySqlColumn>(this.config.fields, undefined, this.dialect.codecs);
 		return this.dialect.buildSelectQuery(this.config);
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 
 	as<TAlias extends string>(
@@ -1043,7 +1087,9 @@ export abstract class MySqlSelectQueryBuilderBase<
 		if (this.config.joins) { for (const it of this.config.joins) usedTables.push(...extractUsedTable(it.table)); }
 
 		return new Proxy(
-			new Subquery(this.getSQL(), this.config.fields, alias, false, [...new Set(usedTables)]),
+			new Subquery(this.withoutSelectionCastCodecs().getSQL(), this.config.fields, alias, false, [
+				...new Set(usedTables),
+			]),
 			new SelectionProxyHandler({ alias, sqlAliasedBehavior: 'alias', sqlBehavior: 'error' }),
 		) as SubqueryWithSelection<this['_']['selectedFields'], TAlias>;
 	}
@@ -1056,110 +1102,32 @@ export abstract class MySqlSelectQueryBuilderBase<
 		) as this['_']['selectedFields'];
 	}
 
+	/** @internal */
+	override withoutSelectionCastCodecs(): this {
+		this.config.ignoreSelectionCastCodecs = true;
+		return this;
+	}
+
 	$dynamic(): MySqlSelectDynamic<this> {
 		return this as any;
 	}
 
 	$withCache(config?: { config?: CacheConfig; tag?: string; autoInvalidate?: boolean } | false) {
 		this.cacheConfig = config === undefined
-			? { config: {}, enable: true, autoInvalidate: true }
+			? { config: {}, enabled: true, autoInvalidate: true }
 			: config === false
-			? { enable: false }
-			: { enable: true, autoInvalidate: true, ...config };
+			? { enabled: false }
+			: { enabled: true, autoInvalidate: true, ...config };
 		return this;
 	}
 }
-
-export interface MySqlSelectBase<
-	TTableName extends string | undefined,
-	TSelection extends ColumnsSelection,
-	TSelectMode extends SelectMode,
-	TPreparedQueryHKT extends PreparedQueryHKTBase,
-	TNullabilityMap extends Record<string, JoinNullability> = TTableName extends string ? Record<TTableName, 'not-null'>
-		: {},
-	TDynamic extends boolean = false,
-	TExcludedMethods extends string = never,
-	TResult extends any[] = SelectResult<TSelection, TSelectMode, TNullabilityMap>[],
-	TSelectedFields extends ColumnsSelection = BuildSubquerySelection<TSelection, TNullabilityMap>,
-> extends
-	MySqlSelectQueryBuilderBase<
-		MySqlSelectHKT,
-		TTableName,
-		TSelection,
-		TSelectMode,
-		TPreparedQueryHKT,
-		TNullabilityMap,
-		TDynamic,
-		TExcludedMethods,
-		TResult,
-		TSelectedFields
-	>,
-	QueryPromise<TResult>
-{}
-
-export class MySqlSelectBase<
-	TTableName extends string | undefined,
-	TSelection,
-	TSelectMode extends SelectMode,
-	TPreparedQueryHKT extends PreparedQueryHKTBase,
-	TNullabilityMap extends Record<string, JoinNullability> = TTableName extends string ? Record<TTableName, 'not-null'>
-		: {},
-	TDynamic extends boolean = false,
-	TExcludedMethods extends string = never,
-	TResult = SelectResult<TSelection, TSelectMode, TNullabilityMap>[],
-	TSelectedFields = BuildSubquerySelection<TSelection, TNullabilityMap>,
-> extends MySqlSelectQueryBuilderBase<
-	MySqlSelectHKT,
-	TTableName,
-	TSelection,
-	TSelectMode,
-	TPreparedQueryHKT,
-	TNullabilityMap,
-	TDynamic,
-	TExcludedMethods,
-	TResult,
-	TSelectedFields
-> {
-	static override readonly [entityKind]: string = 'MySqlSelect';
-
-	prepare(): MySqlSelectPrepare<this> {
-		if (!this.session) {
-			throw new Error('Cannot execute a query on a query builder. Please use a database instance instead.');
-		}
-		const fieldsList = orderSelectedFields<MySqlColumn>(this.config.fields);
-		const query = this.session.prepareQuery<
-			MySqlPreparedQueryConfig & { execute: SelectResult<TSelection, TSelectMode, TNullabilityMap>[] },
-			TPreparedQueryHKT
-		>(this.dialect.sqlToQuery(this.getSQL()), fieldsList, undefined, undefined, undefined, {
-			type: 'select',
-			tables: [...this.usedTables],
-		}, this.cacheConfig);
-		query.joinsNotNullableMap = this.joinsNotNullableMap;
-		return query as MySqlSelectPrepare<this>;
-	}
-
-	execute = ((placeholderValues) => {
-		return this.prepare().execute(placeholderValues);
-	}) as ReturnType<this['prepare']>['execute'];
-
-	private createIterator = (): ReturnType<this['prepare']>['iterator'] => {
-		const self = this;
-		return async function*(placeholderValues) {
-			yield* self.prepare().iterator(placeholderValues);
-		};
-	};
-
-	iterator = this.createIterator();
-}
-
-applyMixins(MySqlSelectBase, [QueryPromise]);
 
 function createSetOperator(type: SetOperator, isAll: boolean): MySqlCreateSetOperatorFn {
 	return (leftSelect, rightSelect, ...restSelects) => {
 		const setOperators = [rightSelect, ...restSelects].map((select) => ({
 			type,
 			isAll,
-			rightSelect: select as AnyMySqlSelect,
+			rightSelect: select as AnyMySqlSelectQueryBuilder,
 		}));
 
 		for (const setOperator of setOperators) {
@@ -1170,7 +1138,7 @@ function createSetOperator(type: SetOperator, isAll: boolean): MySqlCreateSetOpe
 			}
 		}
 
-		return (leftSelect as AnyMySqlSelect).addSetOperators(setOperators) as any;
+		return (leftSelect as AnyMySqlSelectQueryBuilder).addSetOperators(setOperators) as any;
 	};
 }
 
