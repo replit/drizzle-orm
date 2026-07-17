@@ -29,6 +29,7 @@ import '../@types/utils';
 
 type Queryable = Pool | PoolClient;
 type Named = { name: string; schema?: string; table?: string };
+type TableNamed = Named & { schema: string; table: string };
 type RenamePromptItem<T extends Named> = { from: T; to: T };
 type QueryDB = {
 	query: <T extends any = any>(sql: string, params?: any[]) => Promise<T[]>;
@@ -70,6 +71,20 @@ export type LegacyResolver<T extends Named> = (
 	input: LegacyResolverInput<T>,
 ) => Promise<LegacyResolverOutput<T>>;
 
+export type TableScopedResolverInput<T extends TableNamed> =
+	& Omit<
+		LegacyResolverInput<T>,
+		'schema' | 'tableName'
+	>
+	& {
+		schema: string;
+		tableName: string;
+	};
+
+export type TableScopedResolver<T extends TableNamed> = (
+	input: TableScopedResolverInput<T>,
+) => Promise<LegacyResolverOutput<T>>;
+
 const defaultMigrationsConfig = {
 	schema: 'drizzle',
 	table: '__drizzle_migrations',
@@ -82,17 +97,17 @@ const passthroughResolver = async <T extends Named>({ created, deleted }: Legacy
 export const schemasResolver: LegacyResolver<Schema> = passthroughResolver;
 export const enumsResolver: LegacyResolver<Enum> = passthroughResolver;
 export const sequencesResolver: LegacyResolver<Sequence> = passthroughResolver;
-export const policyResolver: LegacyResolver<Policy> = passthroughResolver;
+export const policyResolver: TableScopedResolver<Policy> = passthroughResolver;
 export const indPolicyResolver: LegacyResolver<Policy> = passthroughResolver;
 export const roleResolver: LegacyResolver<Role> = passthroughResolver;
 export const tablesResolver: LegacyResolver<PostgresEntities['tables']> = passthroughResolver;
-export const columnsResolver: LegacyResolver<Column> = passthroughResolver;
+export const columnsResolver: TableScopedResolver<Column> = passthroughResolver;
 export const viewsResolver: LegacyResolver<View> = passthroughResolver;
 
 export type ResolverInput<T extends Named = Named> = LegacyResolverInput<T>;
-export type ColumnsResolverInput = LegacyResolverInput<Column>;
-export type PolicyResolverInput = LegacyResolverInput<Policy>;
-export type TablePolicyResolverInput = LegacyResolverInput<Policy>;
+export type ColumnsResolverInput = TableScopedResolverInput<Column>;
+export type PolicyResolverInput = TableScopedResolverInput<Policy>;
+export type TablePolicyResolverInput = TableScopedResolverInput<Policy>;
 export type RolesResolverInput = LegacyResolverInput<Role>;
 export type { Enum, Role, Sequence, View };
 export type Table = PostgresEntities['tables'];
@@ -299,6 +314,30 @@ function adaptResolver<T extends Named>(resolver: LegacyResolver<T>): Resolver<T
 	};
 }
 
+function adaptTableScopedResolver<T extends TableNamed>(resolver: TableScopedResolver<T>): Resolver<T> {
+	return async ({ created, deleted }) => {
+		const sample = created[0] ?? deleted[0];
+		if (!sample) return { created, deleted, renamedOrMoved: [] };
+
+		const result = await resolver({
+			created,
+			deleted,
+			schema: sample.schema,
+			tableName: sample.table,
+		});
+
+		return {
+			created: result.created,
+			deleted: result.deleted,
+			renamedOrMoved: [
+				...(result.renamed ?? []),
+				...(result.renamedOrMoved ?? []),
+				...(result.moved ?? []).map((move) => movedToRenamed(move, created, deleted)),
+			],
+		};
+	};
+}
+
 const noOpV1Resolver = async <T extends Named>({ created, deleted }: LegacyResolverInput<T>) => {
 	return { created, deleted, renamedOrMoved: [] };
 };
@@ -309,11 +348,11 @@ export const applyPgSnapshotsDiff = async (
 	schemasResolverArg: LegacyResolver<Schema>,
 	enumsResolverArg: LegacyResolver<Enum>,
 	sequencesResolverArg: LegacyResolver<Sequence>,
-	policyResolverArg: LegacyResolver<Policy>,
+	policyResolverArg: TableScopedResolver<Policy>,
 	_indPolicyResolverArg: LegacyResolver<Policy>,
 	roleResolverArg: LegacyResolver<Role>,
 	tablesResolverArg: LegacyResolver<PostgresEntities['tables']>,
-	columnsResolverArg: LegacyResolver<Column>,
+	columnsResolverArg: TableScopedResolver<Column>,
 	viewsResolverArg: LegacyResolver<View>,
 	_validatedTarget: DrizzlePgDBIntrospectSchema,
 	_validatedSource: DrizzlePgDBIntrospectSchema,
@@ -325,11 +364,11 @@ export const applyPgSnapshotsDiff = async (
 		adaptResolver(schemasResolverArg),
 		adaptResolver(enumsResolverArg),
 		adaptResolver(sequencesResolverArg),
-		adaptResolver(policyResolverArg),
+		adaptTableScopedResolver(policyResolverArg),
 		adaptResolver(roleResolverArg),
 		noOpV1Resolver<Privilege>,
 		adaptResolver(tablesResolverArg),
-		adaptResolver(columnsResolverArg),
+		adaptTableScopedResolver(columnsResolverArg),
 		adaptResolver(viewsResolverArg),
 		noOpV1Resolver<UniqueConstraint>,
 		noOpV1Resolver<Index>,
