@@ -1,6 +1,6 @@
-import { ConnectionOptions } from 'tls';
-import type { Driver, Prefix } from './cli/validations/common';
-import type { Dialect } from './schemaValidator';
+import type { ConnectionOptions } from 'tls';
+import type { Driver } from './cli/validations/common';
+import type { Dialect } from './utils/schemaValidator';
 
 // import {SslOptions} from 'mysql2'
 type SslOptions = {
@@ -117,11 +117,9 @@ export type Config =
 		schema?: string | string[];
 		verbose?: boolean;
 		strict?: boolean;
-		casing?: 'camelCase' | 'snake_case';
 		migrations?: {
 			table?: string;
 			schema?: string;
-			prefix?: Prefix;
 		};
 		introspect?: {
 			casing: 'camel' | 'preserve';
@@ -213,6 +211,10 @@ export type Config =
 			dialect: Verify<Dialect, 'sqlite'>;
 			driver: Verify<Driver, 'durable-sqlite'>;
 		}
+		| {
+			dialect: Verify<Dialect, 'sqlite'>;
+			driver: Verify<Driver, 'sqlite-cloud'>;
+		}
 		| {}
 		| {
 			dialect: Verify<Dialect, 'singlestore'>;
@@ -229,28 +231,51 @@ export type Config =
 					url: string;
 				};
 		}
+		// TODO update?
 		| {
-			dialect: Verify<Dialect, 'gel'>;
-			dbCredentials?:
-				& {
-					tlsSecurity?:
-						| 'insecure'
-						| 'no_host_verification'
-						| 'strict'
-						| 'default';
+			dialect: Verify<Dialect, 'mssql'>;
+			dbCredentials:
+				| {
+					port: number;
+					user: string;
+					password: string;
+					database: string;
+					server: string;
+					options?: {
+						encrypt?: boolean;
+						trustServerCertificate?: boolean;
+					};
 				}
-				& (
-					| {
-						url: string;
-					}
-					| ({
-						host: string;
-						port?: number;
-						user?: string;
-						password?: string;
-						database: string;
-					})
-				);
+				| {
+					url: string;
+				};
+		}
+		| {
+			dialect: Verify<Dialect, 'cockroach'>;
+			dbCredentials:
+				| ({
+					host: string;
+					port?: number;
+					user?: string;
+					password?: string;
+					database: string;
+					ssl?:
+						| boolean
+						| 'require'
+						| 'allow'
+						| 'prefer'
+						| 'verify-full'
+						| ConnectionOptions;
+				} & {})
+				| {
+					url: string;
+				};
+		}
+		| {
+			dialect: Verify<Dialect, 'duckdb'>;
+			dbCredentials: {
+				url: string;
+			};
 		}
 	);
 

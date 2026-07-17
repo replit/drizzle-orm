@@ -1,9 +1,15 @@
-import type { BuildColumns, BuildExtraConfigColumns } from '~/column-builder.ts';
+import { type Casing, getCasingFn } from '~/casing.ts';
+import type { BuildColumns, BuildExtraConfigColumns, ColumnBuilderBase } from '~/column-builder.ts';
 import { entityKind } from '~/entity.ts';
-import { Table, type TableConfig as TableConfigBase, type UpdateTableConfig } from '~/table.ts';
+import {
+	type InferTableColumnsModels,
+	Table,
+	type TableConfig as TableConfigBase,
+	type UpdateTableConfig,
+} from '~/table.ts';
 import type { CheckBuilder } from './checks.ts';
 import { getMySqlColumnBuilders, type MySqlColumnBuilders } from './columns/all.ts';
-import type { MySqlColumn, MySqlColumnBuilder, MySqlColumnBuilderBase } from './columns/common.ts';
+import type { MySqlColumn, MySqlColumnBuilder, MySqlColumns } from './columns/common.ts';
 import type { ForeignKey, ForeignKeyBuilder } from './foreign-keys.ts';
 import type { AnyIndexBuilder } from './indexes.ts';
 import type { PrimaryKeyBuilder } from './primary-keys.ts';
@@ -21,15 +27,13 @@ export type MySqlTableExtraConfig = Record<
 	MySqlTableExtraConfigValue
 >;
 
-export type TableConfig = TableConfigBase<MySqlColumn>;
+export type TableConfig = TableConfigBase<MySqlColumns>;
 
 /** @internal */
 export const InlineForeignKeys = Symbol.for('drizzle:MySqlInlineForeignKeys');
 
 export class MySqlTable<T extends TableConfig = TableConfig> extends Table<T> {
 	static override readonly [entityKind]: string = 'MySqlTable';
-
-	declare protected $columns: T['columns'];
 
 	/** @internal */
 	static override readonly Symbol = Object.assign({}, Table.Symbol, {
@@ -54,14 +58,13 @@ export type AnyMySqlTable<TPartial extends Partial<TableConfig> = {}> = MySqlTab
 
 export type MySqlTableWithColumns<T extends TableConfig> =
 	& MySqlTable<T>
-	& {
-		[Key in keyof T['columns']]: T['columns'][Key];
-	};
+	& T['columns']
+	& InferTableColumnsModels<T['columns']>;
 
 export function mysqlTableWithSchema<
 	TTableName extends string,
 	TSchemaName extends string | undefined,
-	TColumnsMap extends Record<string, MySqlColumnBuilderBase>,
+	TColumnsMap extends Record<string, ColumnBuilderBase>,
 >(
 	name: TTableName,
 	columns: TColumnsMap | ((columnTypes: MySqlColumnBuilders) => TColumnsMap),
@@ -71,6 +74,7 @@ export function mysqlTableWithSchema<
 		) => MySqlTableExtraConfig | MySqlTableExtraConfigValue[])
 		| undefined,
 	schema: TSchemaName,
+	casing: Casing | undefined,
 	baseName = name,
 ): MySqlTableWithColumns<{
 	name: TTableName;
@@ -78,6 +82,7 @@ export function mysqlTableWithSchema<
 	columns: BuildColumns<TTableName, TColumnsMap, 'mysql'>;
 	dialect: 'mysql';
 }> {
+	const casingFn = getCasingFn(casing);
 	const rawTable = new MySqlTable<{
 		name: TTableName;
 		schema: TSchemaName;
@@ -90,8 +95,8 @@ export function mysqlTableWithSchema<
 	const builtColumns = Object.fromEntries(
 		Object.entries(parsedColumns).map(([name, colBuilderBase]) => {
 			const colBuilder = colBuilderBase as MySqlColumnBuilder;
-			colBuilder.setName(name);
-			const column = colBuilder.build(rawTable);
+			colBuilder.setName(name, casingFn);
+			const column = colBuilder.build(rawTable).postBuild();
 			rawTable[InlineForeignKeys].push(...colBuilder.buildForeignKeys(column, rawTable));
 			return [name, column];
 		}),
@@ -112,13 +117,13 @@ export function mysqlTableWithSchema<
 		) => MySqlTableExtraConfig;
 	}
 
-	return table;
+	return table as any;
 }
 
 export interface MySqlTableFn<TSchemaName extends string | undefined = undefined> {
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, MySqlColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: TColumnsMap,
@@ -134,7 +139,7 @@ export interface MySqlTableFn<TSchemaName extends string | undefined = undefined
 
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, MySqlColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: (columnTypes: MySqlColumnBuilders) => TColumnsMap,
@@ -169,7 +174,7 @@ export interface MySqlTableFn<TSchemaName extends string | undefined = undefined
 	 */
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, MySqlColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: TColumnsMap,
@@ -205,7 +210,7 @@ export interface MySqlTableFn<TSchemaName extends string | undefined = undefined
 	 */
 	<
 		TTableName extends string,
-		TColumnsMap extends Record<string, MySqlColumnBuilderBase>,
+		TColumnsMap extends Record<string, ColumnBuilderBase>,
 	>(
 		name: TTableName,
 		columns: (columnTypes: MySqlColumnBuilders) => TColumnsMap,
@@ -218,12 +223,18 @@ export interface MySqlTableFn<TSchemaName extends string | undefined = undefined
 	}>;
 }
 
-export const mysqlTable: MySqlTableFn = (name, columns, extraConfig) => {
-	return mysqlTableWithSchema(name, columns, extraConfig, undefined, name);
-};
+/** @internal */
+export function mysqlTableWithCasing(casing: Casing | undefined): MySqlTableFn {
+	return (name, columns, extraConfig) => mysqlTableWithSchema(name, columns, extraConfig, undefined, casing, name);
+}
 
-export function mysqlTableCreator(customizeTableName: (name: string) => string): MySqlTableFn {
+export const mysqlTable = mysqlTableWithCasing(undefined);
+
+export function mysqlTableCreator(
+	customizeTableName: (name: string) => string,
+	casing?: Casing | undefined,
+): MySqlTableFn {
 	return (name, columns, extraConfig) => {
-		return mysqlTableWithSchema(customizeTableName(name) as typeof name, columns, extraConfig, undefined, name);
+		return mysqlTableWithSchema(customizeTableName(name) as typeof name, columns, extraConfig, undefined, casing, name);
 	};
 }

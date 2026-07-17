@@ -14,7 +14,7 @@ export function is<T extends DrizzleEntityClass<any>>(value: any, type: T): valu
 		return false;
 	}
 
-	if (value instanceof type) { // eslint-disable-line no-instanceof/no-instanceof
+	if (value instanceof type) { // oxlint-disable-line drizzle-internal/no-instanceof
 		return true;
 	}
 
@@ -26,7 +26,7 @@ export function is<T extends DrizzleEntityClass<any>>(value: any, type: T): valu
 		);
 	}
 
-	let cls = Object.getPrototypeOf(value).constructor;
+	let cls = Object.getPrototypeOf(value)?.constructor;
 	if (cls) {
 		// Traverse the prototype chain to find the entityKind
 		while (cls) {

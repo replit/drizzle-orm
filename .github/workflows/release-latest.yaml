@@ -1,13 +1,44 @@
 name: Release (latest)
 
-on: workflow_dispatch
+on:
+  workflow_call:
+    secrets:
+      PLANETSCALE_CONNECTION_STRING:
+        required: true
+      NEON_CONNECTION_STRING:
+        required: true
+      NEON_HTTP_CONNECTION_STRING:
+        required: true
+      TIDB_CONNECTION_STRING:
+        required: true
+      XATA_API_KEY:
+        required: true
+      XATA_BRANCH:
+        required: true
+      LIBSQL_REMOTE_URL:
+        required: true
+      LIBSQL_REMOTE_TOKEN:
+        required: true
+      TURSODATABASE_REMOTE_URL:
+        required: true
+      TURSODATABASE_REMOTE_TOKEN:
+        required: true
+      SQLITE_CLOUD_CONNECTION_STRING:
+        required: true
+      SQLITE_MANY_CLOUD_CONNECTION_STRING:
+        required: true
+      TURBO_TOKEN: 
+        required: true
+
+env:
+  TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+  TURBO_TEAM: 'team_KbvYUtAn1Tqytsj8HbNcYDqV'
 
 jobs:
   test:
     strategy:
       matrix:
         shard:
-          - gel
           - planetscale
           - singlestore-core
           - singlestore-proxy
@@ -15,13 +46,14 @@ jobs:
           - singlestore-custom
           - neon-http
           - neon-serverless
+          - cockroach
+          - mssql
           - drizzle-orm
           - drizzle-kit
-          - drizzle-zod
+          - drizzle-kit-cockroach 
+          - drizzle-kit-mssql 
           - drizzle-seed
-          - drizzle-typebox
-          - drizzle-valibot
-          - drizzle-arktype
+          - validators
           - other
     runs-on: ubuntu-22.04
     services:
@@ -77,11 +109,22 @@ jobs:
         ports:
           - 33306:3306
       singlestore:
-        image: ghcr.io/singlestore-labs/singlestoredb-dev:latest
+        image: ghcr.io/singlestore-labs/singlestoredb-dev:0.2.67
         env:
           ROOT_PASSWORD: singlestore
         ports:
           - 33307:3306
+      mssql:
+        image: mcr.microsoft.com/azure-sql-edge
+        env:
+          ACCEPT_EULA: 1
+          MSSQL_SA_PASSWORD: drizzle123PASSWORD!
+        ports:
+          - 1433:1433
+      cockroachdb:
+        image: sukairo02/cockroachdb-launched:latest
+        ports:
+          - 26257:26257
     steps:
       - uses: actions/checkout@v4
 
@@ -111,12 +154,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
+      - uses: actions/cache@v4
+        name: Cache node_modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules
+
       - name: Install dependencies
         run: pnpm install
-
-      - name: Build Prisma client
-        working-directory: drizzle-orm
-        run: pnpm prisma generate --schema src/prisma/schema.prisma
 
       - name: Build
         run: pnpm build
@@ -131,62 +176,93 @@ jobs:
           NEON_CONNECTION_STRING: ${{ secrets.NEON_CONNECTION_STRING }}
           # NEON_HTTP_CONNECTION_STRING: postgres://postgres:postgres@db.localtest.me:5432/postgres
           NEON_HTTP_CONNECTION_STRING: ${{ secrets.NEON_CONNECTION_STRING }}
-          NEON_SERVERLESS_CONNECTION_STRING: postgres://postgres:postgres@localhost:5445/postgres
+          # NEON_CONNECTION_STRING: postgres://postgres:postgres@localhost:5445/postgres
           TIDB_CONNECTION_STRING: ${{ secrets.TIDB_CONNECTION_STRING }}
           XATA_API_KEY: ${{ secrets.XATA_API_KEY }}
           XATA_BRANCH: ${{ secrets.XATA_BRANCH }}
           LIBSQL_URL: file:local.db
           LIBSQL_REMOTE_URL: ${{ secrets.LIBSQL_REMOTE_URL }}
           LIBSQL_REMOTE_TOKEN: ${{ secrets.LIBSQL_REMOTE_TOKEN }}
+          TURSODATABASE_REMOTE_URL: ${{ secrets.TURSODATABASE_REMOTE_URL }}
+          TURSODATABASE_REMOTE_TOKEN: ${{ secrets.TURSODATABASE_REMOTE_TOKEN }}
           SINGLESTORE_CONNECTION_STRING: singlestore://root:singlestore@localhost:33307/
+          COCKROACH_CONNECTION_STRING: postgresql://root@127.0.0.1:26257/defaultdb?sslmode=disable
+          MSSQL_CONNECTION_STRING: mssql://SA:drizzle123PASSWORD!@localhost:1433?encrypt=true&trustServerCertificate=true
+          TEST_CONFIG_PATH_PREFIX: ./tests/cli/
+          SQLITE_CLOUD_CONNECTION_STRING: ${{ secrets.SQLITE_CLOUD_CONNECTION_STRING }}
         working-directory: integration-tests
         run: |
           case ${{ matrix.shard }} in
 
-            gel)
-              pnpm vitest run tests/gel
-            ;;
-
             planetscale)
-              pnpm vitest run \
+              pnpm --stream vitest --reporter=verbose --silent=false run \
                 tests/mysql/mysql-planetscale.test.ts \
                 tests/relational/mysql.planetscale-v1.test.ts \
                 tests/relational/mysql.planetscale.test.ts
             ;;
 
             singlestore-core)
-              pnpm vitest run tests/singlestore/singlestore.test.ts
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/singlestore/singlestore.test.ts
             ;;
 
             singlestore-proxy)
-              pnpm vitest run tests/singlestore/singlestore-proxy.test.ts
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/singlestore/singlestore-proxy.test.ts
             ;;
 
             singlestore-prefixed)
-              pnpm vitest run tests/singlestore/singlestore-prefixed.test.ts
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/singlestore/singlestore-prefixed.test.ts
             ;;
 
             singlestore-custom)
-              pnpm vitest run tests/singlestore/singlestore-custom.test.ts
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/singlestore/singlestore-custom.test.ts
             ;;
 
             neon-http)
-              pnpm vitest run tests/pg/neon-http.test.ts tests/pg/neon-http-batch.test.ts
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/pg/neon-http.test.ts tests/pg/neon-http-batch.test.ts
             ;;
 
             neon-serverless)
               docker compose -f docker-neon.yml up -d
-              pnpm vitest run tests/pg/neon-serverless.test.ts
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/pg/neon-serverless.test.ts
               docker compose -f docker-neon.yml down
             ;;
 
-            drizzle-orm|drizzle-kit|drizzle-zod|drizzle-seed|drizzle-typebox|drizzle-valibot|drizzle-arktype)
+            cockroach)
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/cockroach
+            ;;
+
+            mssql)
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/mssql
+            ;;
+
+            drizzle-kit)
+              cd ../drizzle-kit
+              pnpm test:types
+              pnpm --stream vitest --reporter=verbose --silent=false run\
+              --exclude tests/cockroach \
+              --exclude tests/mssql
+            ;;
+
+            drizzle-kit-cockroach)
+              cd ../drizzle-kit
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/cockroach
+            ;;
+
+            drizzle-kit-mssql)
+              cd ../drizzle-kit
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/mssql
+            ;;
+
+            drizzle-orm|drizzle-seed)
               (cd .. && pnpm test --filter ${{ matrix.shard }})
             ;;
 
+            validators)
+              pnpm --stream vitest --reporter=verbose --silent=false run tests/validators
+            ;;
+
             other)
-              pnpm vitest run \
-                --exclude tests/gel \
+              pnpm --stream vitest --reporter=verbose --silent=false run \
                 --exclude tests/mysql/mysql-planetscale.test.ts \
                 --exclude tests/relational/mysql.planetscale-v1.test.ts \
                 --exclude tests/relational/mysql.planetscale.test.ts \
@@ -196,7 +272,10 @@ jobs:
                 --exclude tests/singlestore/singlestore-custom.test.ts \
                 --exclude tests/pg/neon-http.test.ts \
                 --exclude tests/pg/neon-http-batch.test.ts \
-                --exclude tests/pg/neon-serverless.test.ts
+                --exclude tests/pg/neon-serverless.test.ts \
+                --exclude tests/cockroach \
+                --exclude tests/mssql \
+                --exclude tests/validators
             ;;
 
           esac
@@ -205,13 +284,9 @@ jobs:
     strategy:
       matrix:
         package:
-          - drizzle-orm
           - drizzle-kit
-          - drizzle-zod
           - drizzle-seed
           - drizzle-typebox
-          - drizzle-valibot
-          - drizzle-arktype
           - eslint-plugin-drizzle
     runs-on: ubuntu-22.04
     steps:
@@ -243,6 +318,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
+      - uses: actions/cache@v4
+        name: Cache node_modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules
+
       - name: Install dependencies
         run: pnpm install
 
@@ -266,11 +347,6 @@ jobs:
             } >> $GITHUB_OUTPUT
           fi
 
-      - name: Build Prisma client
-        if: steps.checks.outputs.has_new_release == 'true'
-        working-directory: drizzle-orm
-        run: pnpm prisma generate --schema src/prisma/schema.prisma
-
       - name: Build
         if: steps.checks.outputs.has_new_release == 'true'
         run: pnpm build
@@ -283,78 +359,19 @@ jobs:
       - name: Run @arethetypeswrong/cli
         if: steps.checks.outputs.has_new_release == 'true'
         working-directory: ${{ matrix.package }}
-        run: bunx attw package.tgz
+        run: bun --bun run ../attw-fork/src/run.ts package.tgz
+        env:
+          ATTW_FORMAT: concise
 
-  release:
-    permissions: write-all
-    needs:
-      - test
-      - attw
+
+  attw-orm:
     strategy:
-      fail-fast: false
       matrix:
-        package:
-          - drizzle-orm
-          - drizzle-kit
-          - drizzle-zod
-          - drizzle-seed
-          - drizzle-typebox
-          - drizzle-valibot
-          - drizzle-arktype
-          - eslint-plugin-drizzle
+        shard:
+          - node16-cjs
+          - node16-esm
+          - bundler
     runs-on: ubuntu-22.04
-    services:
-      postgres-postgis:
-        image: postgis/postgis:16-3.4
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: drizzle
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 54322:5432
-      postgres-vector:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: drizzle
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 54321:5432
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: drizzle
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 55433:5432
-      mysql:
-        image: mysql:8
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: drizzle
-        options: >-
-          --health-cmd "mysqladmin ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 33306:3306
     steps:
       - uses: actions/checkout@v4
 
@@ -384,6 +401,107 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
+      - uses: actions/cache@v4
+        name: Cache node_modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Check preconditions
+        id: checks
+        shell: bash
+        working-directory: drizzle-orm
+        run: |
+          old_version="$(jq -r .version package.json)"
+          version="$old_version-$(git rev-parse --short HEAD)"
+          npm version $version
+          tag="${{ github.ref_name }}"
+          is_version_published="$(npm view drizzle-orm versions --json | jq -r '.[] | select(. == "'$version'") | . == "'$version'"')"
+
+          if [[ "$is_version_published" == "true" ]]; then
+            echo "\`drizzle-orm$version\` already published, adding tag \`$tag\`" >> $GITHUB_STEP_SUMMARY
+            npm dist-tag add drizzle-orm@$version $tag
+          else
+            {
+              echo "version=$version"
+              echo "tag=$tag"
+              echo "has_new_release=true"
+            } >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        if: steps.checks.outputs.has_new_release == 'true'
+        run: pnpm build
+      
+      - name: Pack
+        if: steps.checks.outputs.has_new_release == 'true'
+        working-directory: drizzle-orm
+        run: npm run pack
+  
+      - name: Run @arethetypeswrong/cli
+        if: steps.checks.outputs.has_new_release == 'true'
+        working-directory: drizzle-orm
+        run: bun --bun run ../attw-fork/src/run.ts package.tgz ${{ matrix.shard }}
+        env:
+          ATTW_FORMAT: concise
+
+  release:
+    permissions:
+      contents: write # for creating GitHub releases
+      id-token: write # for OIDC
+    needs:
+      - test
+      - attw
+      - attw-orm
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - drizzle-orm
+          - drizzle-kit
+          - drizzle-seed
+          - eslint-plugin-drizzle
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # don't specify registry url, so there's no .npmrc config file
+      - uses: actions/setup-node@v6
+        with: { node-version: '24' }
+
+      - uses: pnpm/action-setup@v3
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: latest
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        name: Setup pnpm cache
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - uses: actions/cache@v4
+        name: Cache node_modules
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules
+
       - name: Install dependencies
         run: pnpm install
 
@@ -398,7 +516,6 @@ jobs:
 
           if [[ "$is_version_published" == "true" ]]; then
             echo "\`${{ matrix.package }}@$version\` already published, adding tag \`latest\`" >> $GITHUB_STEP_SUMMARY
-            npm dist-tag add ${{ matrix.package }}@$version latest
           elif [[ "$latest" != "$version" ]]; then
             echo "Latest:  $latest"
             echo "Current: $version"
@@ -419,11 +536,6 @@ jobs:
             echo "\`$version\` is already latest on NPM" >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Build Prisma client
-        if: steps.checks.outputs.has_new_release == 'true'
-        working-directory: drizzle-orm
-        run: pnpm prisma generate --schema src/prisma/schema.prisma
-
       - name: Build
         if: steps.checks.outputs.has_new_release == 'true'
         run: pnpm build
@@ -432,16 +544,12 @@ jobs:
         if: steps.checks.outputs.has_new_release == 'true'
         working-directory: ${{ matrix.package }}
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
         run: npm run pack
-
+      
       - name: Publish
         if: steps.checks.outputs.has_new_release == 'true'
         working-directory: ${{ matrix.package }}
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
         run: |
           version="${{ steps.checks.outputs.version }}"
 

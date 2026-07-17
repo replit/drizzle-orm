@@ -44,6 +44,7 @@ import type {
 	SelectedFields,
 	SetOperatorRightSelect,
 	SingleStoreCreateSetOperatorFn,
+	SingleStoreCrossJoinFn,
 	SingleStoreJoinFn,
 	SingleStoreSelectConfig,
 	SingleStoreSelectDynamic,
@@ -210,7 +211,9 @@ export abstract class SingleStoreSelectQueryBuilderBase<
 	>(
 		joinType: TJoinType,
 		lateral: TIsLateral,
-	): SingleStoreJoinFn<this, TDynamic, TJoinType, TIsLateral> {
+	): 'cross' extends TJoinType ? SingleStoreCrossJoinFn<this, TDynamic, TIsLateral>
+		: SingleStoreJoinFn<this, TDynamic, TJoinType, TIsLateral>
+	{
 		return (
 			table: SingleStoreTable | Subquery | SQL, // | SingleStoreViewBase
 			on?: ((aliases: TSelection) => SQL | undefined) | SQL | undefined,
@@ -898,12 +901,12 @@ export abstract class SingleStoreSelectQueryBuilderBase<
 
 	/** @internal */
 	getSQL(): SQL {
+		this.config.fieldsFlat = orderSelectedFields<SingleStoreColumn>(this.config.fields);
 		return this.dialect.buildSelectQuery(this.config);
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 
 	as<TAlias extends string>(
@@ -925,6 +928,11 @@ export abstract class SingleStoreSelectQueryBuilderBase<
 			this.config.fields,
 			new SelectionProxyHandler({ alias: this.tableName, sqlAliasedBehavior: 'alias', sqlBehavior: 'error' }),
 		) as this['_']['selectedFields'];
+	}
+
+	/** @internal */
+	override withoutSelectionCastCodecs(): this {
+		return this;
 	}
 
 	$dynamic(): SingleStoreSelectDynamic<this> {
@@ -988,24 +996,26 @@ export class SingleStoreSelectBase<
 		if (!this.session) {
 			throw new Error('Cannot execute a query on a query builder. Please use a database instance instead.');
 		}
-		const fieldsList = orderSelectedFields<SingleStoreColumn>(this.config.fields);
-		const query = this.session.prepareQuery<
+		// Build query before accessing `fieldsFlat` - build mutates it
+		const query = this.dialect.sqlToQuery(this.getSQL());
+		const fieldsList = this.config.fieldsFlat!;
+		const preparedQuery = this.session.prepareQuery<
 			SingleStorePreparedQueryConfig & { execute: SelectResult<TSelection, TSelectMode, TNullabilityMap>[] },
 			TPreparedQueryHKT
-		>(this.dialect.sqlToQuery(this.getSQL()), fieldsList, undefined, undefined, undefined, {
+		>(query, fieldsList, undefined, undefined, undefined, {
 			type: 'select',
 			tables: [...this.usedTables],
 		}, this.cacheConfig);
-		query.joinsNotNullableMap = this.joinsNotNullableMap;
-		return query as SingleStoreSelectPrepare<this>;
+		preparedQuery.joinsNotNullableMap = this.joinsNotNullableMap;
+		return preparedQuery as SingleStoreSelectPrepare<this>;
 	}
 
 	$withCache(config?: { config?: CacheConfig; tag?: string; autoInvalidate?: boolean } | false) {
 		this.cacheConfig = config === undefined
-			? { config: {}, enable: true, autoInvalidate: true }
+			? { config: {}, enabled: true, autoInvalidate: true }
 			: config === false
-			? { enable: false }
-			: { enable: true, autoInvalidate: true, ...config };
+			? { enabled: false }
+			: { enabled: true, autoInvalidate: true, ...config };
 		return this;
 	}
 
