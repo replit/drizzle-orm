@@ -38,6 +38,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.repository == 'drizzle-team/drizzle-orm'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -86,6 +87,7 @@ jobs:
         run: pnpm test:types-lint
 
   test:
+    if: github.repository == 'drizzle-team/drizzle-orm'
     # NOTE: no 'needs: [prepare]' on purpose — start early, warm DBs, then wait for artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -293,6 +295,7 @@ jobs:
           esac
 
   attw:
+    if: github.repository == 'drizzle-team/drizzle-orm'
     needs: [prepare]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -318,6 +321,7 @@ jobs:
           ATTW_FORMAT: concise
 
   attw-orm:
+    if: github.repository == 'drizzle-team/drizzle-orm'
     needs: [prepare]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -342,6 +346,34 @@ jobs:
         run: bun --bun run ../attw-fork/src/run.ts ../artifacts/drizzle-orm/package.tgz ${{ matrix.package }}
         env:
           ATTW_FORMAT: concise
+
+  replit:
+    if: github.repository == 'replit/drizzle-orm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: pnpm/action-setup@v4
+        with: { run_install: false }
+      - uses: actions/setup-node@v6
+        with: { node-version: '24', registry-url: 'https://registry.npmjs.org', cache: 'pnpm', cache-dependency-path: pnpm-lock.yaml }
+      - run: pnpm install --frozen-lockfile --prefer-offline
+      - name: Lint
+        run: pnpm lint:check
+      - name: Build Drizzle ORM dependency
+        run: pnpm --filter drizzle-orm build
+      - name: Test Drizzle Kit types
+        run: pnpm --filter drizzle-kit test:types
+      - name: Build upstream Drizzle Kit
+        if: hashFiles('drizzle-kit/tests/other/replit-api.test.ts') == ''
+        run: pnpm --filter drizzle-kit build
+      - name: Test Replit compatibility API
+        if: hashFiles('drizzle-kit/tests/other/replit-api.test.ts') != ''
+        run: pnpm --dir drizzle-kit exec vitest run tests/other/replit-api.test.ts
+      - name: Build Replit package
+        if: hashFiles('drizzle-kit/tests/other/replit-api.test.ts') != ''
+        run: pnpm --filter drizzle-kit pack:replit
 
   skills-revision-gate:
     runs-on: ubuntu-24.04
