@@ -2807,7 +2807,7 @@ class PgDeleteForeignKeyConvertor extends Convertor {
 			? `"${statement.schema}"."${tableFrom}"`
 			: `"${tableFrom}"`;
 
-		return `ALTER TABLE ${tableNameWithSchema} DROP CONSTRAINT "${name}";\n`;
+		return `ALTER TABLE ${tableNameWithSchema} DROP CONSTRAINT IF EXISTS "${name}";\n`;
 	}
 }
 

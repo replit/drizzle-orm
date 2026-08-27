@@ -26,6 +26,13 @@ const driversPackages = [
 	'@duckdb/node-api',
 ];
 
+// Problematic dependencies that should be external
+const externalDeps = [
+	'json-diff',
+	'commander',
+	'glob',
+];
+
 esbuild.buildSync({
 	entryPoints: ['./src/cli/index.ts'],
 	bundle: true,
