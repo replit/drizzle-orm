@@ -129,4 +129,35 @@ describe('Replit compatibility API', () => {
 		expect(result.statementsToExecute).toEqual(['CREATE SCHEMA "private";\n']);
 		expect(result.shouldAskForApprove).toBe(false);
 	});
+
+	test('uses a bounded row-existence query for unique constraints', async () => {
+		const db = { query: vi.fn().mockResolvedValue([{}]) };
+		const selectResolver = vi.fn().mockResolvedValue({
+			data: { index: 0, value: 'no' },
+		});
+		const statements: JsonStatement[] = [{
+			type: 'add_unique',
+			unique: {
+				entityType: 'uniques',
+				schema: 'public',
+				table: 'users',
+				name: 'users_email_unique',
+				nameExplicit: true,
+				columns: ['email'],
+				nullsNotDistinct: false,
+			},
+		}];
+
+		await pgSuggestions(db, statements, selectResolver);
+
+		expect(db.query).toHaveBeenCalledWith('select 1 from "users" limit 1');
+		expect(selectResolver).toHaveBeenCalledWith({
+			entity: {
+				type: 'createUniqueConstraint',
+				name: 'users_email_unique',
+				tableName: 'users',
+			},
+			items: ['no', 'yes'],
+		});
+	});
 });

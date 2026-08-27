@@ -104,7 +104,6 @@ export type SelectResolverInput = {
 	entity: {
 		type: 'createUniqueConstraint';
 		name: string;
-		count: number;
 		tableName: string;
 	};
 	items: string[];
@@ -363,9 +362,8 @@ async function maybeAddUniqueTruncateStatement({
 
 	const unique = statement.unique;
 	const tableName = quotedIdentifier({ schema: unique.schema, name: unique.table });
-	const res = await db.query<{ count: string | number }>(`select count(*) as count from ${tableName}`);
-	const count = Number(res[0]?.count ?? 0);
-	if (count <= 0) {
+	const rows = await db.query(`select 1 from ${tableName} limit 1`);
+	if (rows.length === 0) {
 		return;
 	}
 
@@ -373,7 +371,6 @@ async function maybeAddUniqueTruncateStatement({
 		entity: {
 			type: 'createUniqueConstraint',
 			name: unique.name,
-			count,
 			tableName: unique.table,
 		},
 		items: ['no', 'yes'],
