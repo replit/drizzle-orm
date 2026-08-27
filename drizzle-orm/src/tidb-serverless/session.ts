@@ -3,6 +3,7 @@ import { type Cache, NoopCache } from '~/cache/core/index.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { Column } from '~/column.ts';
 
+import type * as V1 from '~/_relations.ts';
 import { entityKind, is } from '~/entity.ts';
 import type { Logger } from '~/logger.ts';
 import { NoopLogger } from '~/logger.ts';
@@ -16,15 +17,23 @@ import {
 	MySqlSession,
 	MySqlTransaction,
 } from '~/mysql-core/session.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import { fillPlaceholders, type Query, type SQL, sql } from '~/sql/sql.ts';
-import { type Assume, mapResultRow } from '~/utils.ts';
+import { type Assume, makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 
 const executeRawConfig = { fullResult: true } satisfies ExecuteOptions;
 const queryConfig = { arrayMode: true } satisfies ExecuteOptions;
 
-export class TiDBServerlessPreparedQuery<T extends MySqlPreparedQueryConfig> extends MySqlPreparedQuery<T> {
+export class TiDBServerlessPreparedQuery<T extends MySqlPreparedQueryConfig, TIsRqbV2 extends boolean = false>
+	extends MySqlPreparedQuery<T>
+{
 	static override readonly [entityKind]: string = 'TiDBPreparedQuery';
+	private jitMapper?: RowsMapper<T['execute']> | RelationalRowsMapper<T['execute']>;
 
 	constructor(
 		private client: Tx | Connection,
@@ -38,16 +47,23 @@ export class TiDBServerlessPreparedQuery<T extends MySqlPreparedQueryConfig> ext
 		} | undefined,
 		cacheConfig: WithCacheConfig | undefined,
 		private fields: SelectedFieldsOrdered | undefined,
-		private customResultMapper?: (rows: unknown[][]) => T['execute'],
+		private useJitMappers: boolean | undefined,
+		private customResultMapper?: (
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
+		) => T['execute'],
 		// Keys that were used in $default and the value that was generated for them
 		private generatedIds?: Record<string, unknown>[],
 		// Keys that should be returned, it has the column with all properries + key from object
 		private returningIds?: SelectedFieldsOrdered,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super(cache, queryMetadata, cacheConfig);
 	}
 
 	async execute(placeholderValues: Record<string, unknown> | undefined = {}): Promise<T['execute']> {
+		if (this.isRqbV2Query) return this.executeRqbV2(placeholderValues);
+
 		const params = fillPlaceholders(this.params, placeholderValues);
 
 		this.logger.logQuery(this.queryString, params);
@@ -90,10 +106,30 @@ export class TiDBServerlessPreparedQuery<T extends MySqlPreparedQueryConfig> ext
 		});
 
 		if (customResultMapper) {
-			return customResultMapper(rows);
+			return (customResultMapper as (rows: unknown[][]) => T['execute'])(rows);
 		}
 
-		return rows.map((row) => mapResultRow<T['execute']>(fields!, row, joinsNotNullableMap));
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['execute']>
+				?? makeJitQueryMapper<T['execute']>(fields!, joinsNotNullableMap))(rows)
+			: rows.map((row) => mapResultRow(fields!, row, joinsNotNullableMap));
+	}
+
+	private async executeRqbV2(placeholderValues: Record<string, unknown> | undefined = {}): Promise<T['execute']> {
+		const params = fillPlaceholders(this.params, placeholderValues);
+
+		this.logger.logQuery(this.queryString, params);
+
+		const { client, queryString, customResultMapper } = this;
+		const res = await client.execute(queryString, params, executeRawConfig) as FullResult;
+
+		const { rows } = res;
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['execute']>
+				?? makeJitRqbMapper<T['execute']>(this.rqbConfig!))((rows ?? []) as Record<string, any>[])
+			: (customResultMapper as (rows: Record<string, unknown>[]) => T['execute'])(
+				(rows ?? []) as Record<string, any>[],
+			);
 	}
 
 	override iterator(_placeholderValues?: Record<string, unknown>): AsyncGenerator<T['iterator']> {
@@ -104,12 +140,20 @@ export class TiDBServerlessPreparedQuery<T extends MySqlPreparedQueryConfig> ext
 export interface TiDBServerlessSessionOptions {
 	logger?: Logger;
 	cache?: Cache;
+	useJitMappers?: boolean;
 }
 
 export class TiDBServerlessSession<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends MySqlSession<TiDBServerlessQueryResultHKT, TiDBServerlessPreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends MySqlSession<
+	TiDBServerlessQueryResultHKT,
+	TiDBServerlessPreparedQueryHKT,
+	TFullSchema,
+	TRelations,
+	TSchema
+> {
 	static override readonly [entityKind]: string = 'TiDBServerlessSession';
 
 	private logger: Logger;
@@ -120,7 +164,8 @@ export class TiDBServerlessSession<
 		private baseClient: Connection,
 		dialect: MySqlDialect,
 		tx: Tx | undefined,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
 		private options: TiDBServerlessSessionOptions = {},
 	) {
 		super(dialect);
@@ -150,9 +195,36 @@ export class TiDBServerlessSession<
 			queryMetadata,
 			cacheConfig,
 			fields,
+			this.options.useJitMappers,
 			customResultMapper,
 			generatedIds,
 			returningIds,
+		);
+	}
+
+	prepareRelationalQuery<T extends MySqlPreparedQueryConfig = MySqlPreparedQueryConfig>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		customResultMapper: (rows: Record<string, unknown>[]) => T['execute'],
+		config: RelationalQueryMapperConfig,
+		generatedIds?: Record<string, unknown>[],
+		returningIds?: SelectedFieldsOrdered,
+	): MySqlPreparedQuery<T> {
+		return new TiDBServerlessPreparedQuery(
+			this.client,
+			query.sql,
+			query.params,
+			this.logger,
+			this.cache,
+			undefined,
+			undefined,
+			fields,
+			this.options.useJitMappers,
+			customResultMapper,
+			generatedIds,
+			returningIds,
+			true,
+			config,
 		);
 	}
 
@@ -171,14 +243,22 @@ export class TiDBServerlessSession<
 	}
 
 	override async transaction<T>(
-		transaction: (tx: TiDBServerlessTransaction<TFullSchema, TSchema>) => Promise<T>,
+		transaction: (tx: TiDBServerlessTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 	): Promise<T> {
 		const nativeTx = await this.baseClient.begin();
 		try {
-			const session = new TiDBServerlessSession(this.baseClient, this.dialect, nativeTx, this.schema, this.options);
-			const tx = new TiDBServerlessTransaction<TFullSchema, TSchema>(
+			const session = new TiDBServerlessSession(
+				this.baseClient,
 				this.dialect,
-				session as MySqlSession<any, any, any, any>,
+				nativeTx,
+				this.relations,
+				this.schema,
+				this.options,
+			);
+			const tx = new TiDBServerlessTransaction<TFullSchema, TRelations, TSchema>(
+				this.dialect,
+				session as MySqlSession<any, any, any, any, any>,
+				this.relations,
 				this.schema,
 			);
 			const result = await transaction(tx);
@@ -193,26 +273,35 @@ export class TiDBServerlessSession<
 
 export class TiDBServerlessTransaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends MySqlTransaction<TiDBServerlessQueryResultHKT, TiDBServerlessPreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends MySqlTransaction<
+	TiDBServerlessQueryResultHKT,
+	TiDBServerlessPreparedQueryHKT,
+	TFullSchema,
+	TRelations,
+	TSchema
+> {
 	static override readonly [entityKind]: string = 'TiDBServerlessTransaction';
 
 	constructor(
 		dialect: MySqlDialect,
 		session: MySqlSession,
-		schema: RelationalSchemaConfig<TSchema> | undefined,
+		relations: TRelations,
+		schema: V1.RelationalSchemaConfig<TSchema> | undefined,
 		nestedIndex = 0,
 	) {
-		super(dialect, session, schema, nestedIndex, 'default');
+		super(dialect, session, relations, schema, nestedIndex, 'default');
 	}
 
 	override async transaction<T>(
-		transaction: (tx: TiDBServerlessTransaction<TFullSchema, TSchema>) => Promise<T>,
+		transaction: (tx: TiDBServerlessTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 	): Promise<T> {
 		const savepointName = `sp${this.nestedIndex + 1}`;
-		const tx = new TiDBServerlessTransaction<TFullSchema, TSchema>(
+		const tx = new TiDBServerlessTransaction<TFullSchema, TRelations, TSchema>(
 			this.dialect,
 			this.session,
+			this.relations,
 			this.schema,
 			this.nestedIndex + 1,
 		);

@@ -1,8 +1,14 @@
 import type { BindParams, Database } from 'sql.js';
+import type * as V1 from '~/_relations.ts';
 import { entityKind } from '~/entity.ts';
 import type { Logger } from '~/logger.ts';
 import { NoopLogger } from '~/logger.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import { fillPlaceholders, type Query, sql } from '~/sql/sql.ts';
 import type { SQLiteSyncDialect } from '~/sqlite-core/dialect.ts';
 import { SQLiteTransaction } from '~/sqlite-core/index.ts';
@@ -13,18 +19,20 @@ import type {
 	SQLiteTransactionConfig,
 } from '~/sqlite-core/session.ts';
 import { SQLitePreparedQuery as PreparedQueryBase, SQLiteSession } from '~/sqlite-core/session.ts';
-import { mapResultRow } from '~/utils.ts';
+import { type DrizzleTypeError, makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 
 export interface SQLJsSessionOptions {
 	logger?: Logger;
+	useJitMappers?: boolean;
 }
 
 type PreparedQueryConfig = Omit<PreparedQueryConfigBase, 'statement' | 'run'>;
 
 export class SQLJsSession<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteSession<'sync', void, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteSession<'sync', void, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'SQLJsSession';
 
 	private logger: Logger;
@@ -32,8 +40,9 @@ export class SQLJsSession<
 	constructor(
 		private client: Database,
 		dialect: SQLiteSyncDialect,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
-		options: SQLJsSessionOptions = {},
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
+		private options: SQLJsSessionOptions = {},
 	) {
 		super(dialect);
 		this.logger = options.logger ?? new NoopLogger();
@@ -43,16 +52,42 @@ export class SQLJsSession<
 		query: Query,
 		fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		isResponseInArrayMode: boolean,
 	): PreparedQuery<T> {
-		return new PreparedQuery(this.client, query, this.logger, fields, executeMethod, isResponseInArrayMode);
+		return new PreparedQuery(
+			this.client,
+			query,
+			this.logger,
+			fields,
+			executeMethod,
+			this.options.useJitMappers,
+		);
+	}
+
+	prepareRelationalQuery<T extends Omit<PreparedQueryConfig, 'run'>>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		executeMethod: SQLiteExecuteMethod,
+		customResultMapper: (rows: Record<string, unknown>[]) => unknown,
+		config: RelationalQueryMapperConfig,
+	): PreparedQuery<T, true> {
+		return new PreparedQuery(
+			this.client,
+			query,
+			this.logger,
+			fields,
+			executeMethod,
+			this.options.useJitMappers,
+			customResultMapper,
+			true,
+			config,
+		);
 	}
 
 	override transaction<T>(
-		transaction: (tx: SQLJsTransaction<TFullSchema, TSchema>) => T,
+		transaction: (tx: SQLJsTransaction<TFullSchema, TRelations, TSchema>) => T,
 		config: SQLiteTransactionConfig = {},
 	): T {
-		const tx = new SQLJsTransaction('sync', this.dialect, this, this.schema);
+		const tx = new SQLJsTransaction('sync', this.dialect, this, this.relations, this.schema);
 		this.run(sql.raw(`begin${config.behavior ? ` ${config.behavior}` : ''}`));
 		try {
 			const result = transaction(tx);
@@ -67,18 +102,31 @@ export class SQLJsSession<
 
 export class SQLJsTransaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteTransaction<'sync', void, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteTransaction<'sync', void, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'SQLJsTransaction';
 
-	override transaction<T>(transaction: (tx: SQLJsTransaction<TFullSchema, TSchema>) => T): T {
+	override transaction<T>(
+		transaction: (
+			tx: SQLJsTransaction<TFullSchema, TRelations, TSchema>,
+		) => T extends Promise<any> ? DrizzleTypeError<"Sync drivers can't use async functions in transactions!">
+			: T,
+	): T {
 		const savepointName = `sp${this.nestedIndex + 1}`;
-		const tx = new SQLJsTransaction('sync', this.dialect, this.session, this.schema, this.nestedIndex + 1);
+		const tx = new SQLJsTransaction(
+			'sync',
+			this.dialect,
+			this.session,
+			this.relations,
+			this.schema,
+			this.nestedIndex + 1,
+		);
 		tx.run(sql.raw(`savepoint ${savepointName}`));
 		try {
 			const result = transaction(tx);
 			tx.run(sql.raw(`release savepoint ${savepointName}`));
-			return result;
+			return result as T;
 		} catch (err) {
 			tx.run(sql.raw(`rollback to savepoint ${savepointName}`));
 			throw err;
@@ -86,10 +134,13 @@ export class SQLJsTransaction<
 	}
 }
 
-export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> extends PreparedQueryBase<
-	{ type: 'sync'; run: void; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
-> {
+export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig, TIsRqbV2 extends boolean = false>
+	extends PreparedQueryBase<
+		{ type: 'sync'; run: void; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
+	>
+{
 	static override readonly [entityKind]: string = 'SQLJsPreparedQuery';
+	private jitMapper?: RowsMapper<any> | RelationalRowsMapper<any>;
 
 	constructor(
 		private client: Database,
@@ -97,8 +148,13 @@ export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> 
 		private logger: Logger,
 		private fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		private _isResponseInArrayMode: boolean,
-		private customResultMapper?: (rows: unknown[][], mapColumnValue?: (value: unknown) => unknown) => unknown,
+		private useJitMappers: boolean | undefined,
+		private customResultMapper?: (
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
+			mapColumnValue?: (value: unknown) => unknown,
+		) => unknown,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super('sync', executeMethod, query);
 	}
@@ -116,6 +172,7 @@ export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> 
 	}
 
 	all(placeholderValues?: Record<string, unknown>): T['all'] {
+		if (this.isRqbV2Query) return this.allRqbV2(placeholderValues);
 		const stmt = this.client.prepare(this.query.sql);
 
 		const { fields, joinsNotNullableMap, logger, query, customResultMapper } = this;
@@ -136,13 +193,43 @@ export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> 
 		const rows = this.values(placeholderValues) as unknown[][];
 
 		if (customResultMapper) {
-			return customResultMapper(rows, normalizeFieldValue) as T['all'];
+			return (customResultMapper as (
+				rows: unknown[][],
+				mapColumnValue?: (value: unknown) => unknown,
+			) => unknown)(rows, normalizeFieldValue) as T['all'];
 		}
 
-		return rows.map((row) => mapResultRow(fields!, row.map((v) => normalizeFieldValue(v)), joinsNotNullableMap));
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['all']>
+				?? makeJitQueryMapper<T['all']>(fields!, joinsNotNullableMap))(rows)
+			: rows.map((row) => mapResultRow(fields!, row, joinsNotNullableMap));
+	}
+
+	private allRqbV2(placeholderValues?: Record<string, unknown>): T['all'] {
+		const stmt = this.client.prepare(this.query.sql);
+
+		const { logger, query, customResultMapper } = this;
+		const params = fillPlaceholders(query.params, placeholderValues ?? {});
+		logger.logQuery(query.sql, params);
+		stmt.bind(params as BindParams);
+		const rows: Record<string, unknown>[] = [];
+		while (stmt.step()) {
+			rows.push(stmt.getAsObject());
+		}
+
+		stmt.free();
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['all']>
+				?? makeJitRqbMapper<T['all']>(this.rqbConfig!))(rows)
+			: (customResultMapper as (
+				rows: Record<string, unknown>[],
+				mapColumnValue?: (value: unknown) => unknown,
+			) => unknown)(rows, normalizeFieldValue) as T['all'];
 	}
 
 	get(placeholderValues?: Record<string, unknown>): T['get'] {
+		if (this.isRqbV2Query) return this.getRqbV2(placeholderValues);
 		const stmt = this.client.prepare(this.query.sql);
 
 		const params = fillPlaceholders(this.query.params, placeholderValues ?? {});
@@ -166,10 +253,52 @@ export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> 
 		}
 
 		if (customResultMapper) {
-			return customResultMapper([row], normalizeFieldValue) as T['get'];
+			return (customResultMapper as (
+				rows: unknown[][],
+				mapColumnValue?: (value: unknown) => unknown,
+			) => unknown)([row], normalizeFieldValue) as T['get'];
 		}
 
-		return mapResultRow(fields!, row.map((v) => normalizeFieldValue(v)), joinsNotNullableMap);
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['get'][]>
+				?? makeJitQueryMapper<T['get'][]>(fields!, joinsNotNullableMap))(
+					[row],
+				)[0]
+			: mapResultRow(fields!, row, joinsNotNullableMap);
+	}
+
+	private getRqbV2(placeholderValues?: Record<string, unknown>): T['get'] {
+		const stmt = this.client.prepare(this.query.sql);
+
+		const params = fillPlaceholders(this.query.params, placeholderValues ?? {});
+		this.logger.logQuery(this.query.sql, params);
+
+		const { customResultMapper } = this;
+
+		const row = stmt.getAsObject(params as BindParams);
+
+		stmt.free();
+
+		if (!row) {
+			return undefined;
+		}
+
+		let nonUndef = false;
+		for (const v of Object.values(row)) {
+			if (v !== undefined) {
+				nonUndef = true;
+				break;
+			}
+		}
+		if (!nonUndef) return undefined;
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['get'][]>
+				?? makeJitRqbMapper<T['get'][]>(this.rqbConfig!))([row])
+			: (customResultMapper as (
+				rows: Record<string, unknown>[],
+				mapColumnValue?: (value: unknown) => unknown,
+			) => unknown)([row], normalizeFieldValue) as T['get'];
 	}
 
 	values(placeholderValues?: Record<string, unknown>): T['values'] {
@@ -187,17 +316,12 @@ export class PreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> 
 
 		return rows;
 	}
-
-	/** @internal */
-	isResponseInArrayMode(): boolean {
-		return this._isResponseInArrayMode;
-	}
 }
 
 function normalizeFieldValue(value: unknown) {
-	if (value instanceof Uint8Array) { // eslint-disable-line no-instanceof/no-instanceof
+	if (value instanceof Uint8Array) { // oxlint-disable-line drizzle-internal/no-instanceof
 		if (typeof Buffer !== 'undefined') {
-			if (!(value instanceof Buffer)) { // eslint-disable-line no-instanceof/no-instanceof
+			if (!(value instanceof Buffer)) { // oxlint-disable-line drizzle-internal/no-instanceof
 				return Buffer.from(value);
 			}
 			return value;

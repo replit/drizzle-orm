@@ -1,11 +1,17 @@
 import type { Client, InArgs, InStatement, ResultSet, Transaction } from '@libsql/client';
-import type { BatchItem as BatchItem } from '~/batch.ts';
+import type * as V1 from '~/_relations.ts';
+import type { BatchItem } from '~/batch.ts';
 import { type Cache, NoopCache } from '~/cache/core/index.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { entityKind } from '~/entity.ts';
 import type { Logger } from '~/logger.ts';
 import { NoopLogger } from '~/logger.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import type { PreparedQuery } from '~/session.ts';
 import { fillPlaceholders, type Query, sql } from '~/sql/sql.ts';
 import type { SQLiteAsyncDialect } from '~/sqlite-core/dialect.ts';
@@ -17,19 +23,21 @@ import type {
 	SQLiteTransactionConfig,
 } from '~/sqlite-core/session.ts';
 import { SQLitePreparedQuery, SQLiteSession } from '~/sqlite-core/session.ts';
-import { mapResultRow } from '~/utils.ts';
+import { makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 
 export interface LibSQLSessionOptions {
 	logger?: Logger;
 	cache?: Cache;
+	useJitMappers?: boolean;
 }
 
 type PreparedQueryConfig = Omit<PreparedQueryConfigBase, 'statement' | 'run'>;
 
 export class LibSQLSession<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteSession<'async', ResultSet, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteSession<'async', ResultSet, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'LibSQLSession';
 
 	private logger: Logger;
@@ -38,7 +46,8 @@ export class LibSQLSession<
 	constructor(
 		private client: Client,
 		dialect: SQLiteAsyncDialect,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
 		private options: LibSQLSessionOptions,
 		private tx: Transaction | undefined,
 	) {
@@ -51,7 +60,6 @@ export class LibSQLSession<
 		query: Query,
 		fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		isResponseInArrayMode: boolean,
 		customResultMapper?: (rows: unknown[][]) => unknown,
 		queryMetadata?: {
 			type: 'select' | 'update' | 'delete' | 'insert';
@@ -69,8 +77,32 @@ export class LibSQLSession<
 			fields,
 			this.tx,
 			executeMethod,
-			isResponseInArrayMode,
+			this.options.useJitMappers,
 			customResultMapper,
+		);
+	}
+
+	prepareRelationalQuery<T extends Omit<PreparedQueryConfig, 'run'>>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		executeMethod: SQLiteExecuteMethod,
+		customResultMapper: (rows: Record<string, unknown>[]) => unknown,
+		config: RelationalQueryMapperConfig,
+	): LibSQLPreparedQuery<T, true> {
+		return new LibSQLPreparedQuery(
+			this.client,
+			query,
+			this.logger,
+			this.cache,
+			undefined,
+			undefined,
+			fields,
+			this.tx,
+			executeMethod,
+			this.options.useJitMappers,
+			customResultMapper,
+			true,
+			config,
 		);
 	}
 
@@ -105,19 +137,26 @@ export class LibSQLSession<
 	}
 
 	override async transaction<T>(
-		transaction: (db: LibSQLTransaction<TFullSchema, TSchema>) => T | Promise<T>,
+		transaction: (db: LibSQLTransaction<TFullSchema, TRelations, TSchema>) => T | Promise<T>,
 		_config?: SQLiteTransactionConfig,
 	): Promise<T> {
 		// TODO: support transaction behavior
 		const libsqlTx = await this.client.transaction();
-		const session = new LibSQLSession<TFullSchema, TSchema>(
+		const session = new LibSQLSession<TFullSchema, TRelations, TSchema>(
 			this.client,
 			this.dialect,
+			this.relations,
 			this.schema,
 			this.options,
 			libsqlTx,
 		);
-		const tx = new LibSQLTransaction<TFullSchema, TSchema>('async', this.dialect, session, this.schema);
+		const tx = new LibSQLTransaction<TFullSchema, TRelations, TSchema>(
+			'async',
+			this.dialect,
+			session,
+			this.relations,
+			this.schema,
+		);
 		try {
 			const result = await transaction(tx);
 			await libsqlTx.commit();
@@ -143,13 +182,23 @@ export class LibSQLSession<
 
 export class LibSQLTransaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteTransaction<'async', ResultSet, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteTransaction<'async', ResultSet, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'LibSQLTransaction';
 
-	override async transaction<T>(transaction: (tx: LibSQLTransaction<TFullSchema, TSchema>) => Promise<T>): Promise<T> {
+	override async transaction<T>(
+		transaction: (tx: LibSQLTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
+	): Promise<T> {
 		const savepointName = `sp${this.nestedIndex}`;
-		const tx = new LibSQLTransaction('async', this.dialect, this.session, this.schema, this.nestedIndex + 1);
+		const tx = new LibSQLTransaction(
+			'async',
+			this.dialect,
+			this.session,
+			this.relations,
+			this.schema,
+			this.nestedIndex + 1,
+		);
 		await this.session.run(sql.raw(`savepoint ${savepointName}`));
 		try {
 			const result = await transaction(tx);
@@ -162,10 +211,13 @@ export class LibSQLTransaction<
 	}
 }
 
-export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> extends SQLitePreparedQuery<
-	{ type: 'async'; run: ResultSet; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
-> {
+export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig, TIsRqbV2 extends boolean = false>
+	extends SQLitePreparedQuery<
+		{ type: 'async'; run: ResultSet; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
+	>
+{
 	static override readonly [entityKind]: string = 'LibSQLPreparedQuery';
+	private jitMapper?: RowsMapper<any> | RelationalRowsMapper<any>;
 
 	constructor(
 		private client: Client,
@@ -180,15 +232,15 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 		/** @internal */ public fields: SelectedFieldsOrdered | undefined,
 		private tx: Transaction | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		private _isResponseInArrayMode: boolean,
-		/** @internal */ public customResultMapper?: (
-			rows: unknown[][],
+		private useJitMappers: boolean | undefined,
+		private customResultMapper?: (
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
 			mapColumnValue?: (value: unknown) => unknown,
 		) => unknown,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super('async', executeMethod, query, cache, queryMetadata, cacheConfig);
-		this.customResultMapper = customResultMapper;
-		this.fields = fields;
 	}
 
 	async run(placeholderValues?: Record<string, unknown>): Promise<ResultSet> {
@@ -201,6 +253,8 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 	}
 
 	async all(placeholderValues?: Record<string, unknown>): Promise<T['all']> {
+		if (this.isRqbV2Query) return this.allRqbV2(placeholderValues);
+
 		const { fields, logger, query, tx, client, customResultMapper } = this;
 		if (!fields && !customResultMapper) {
 			const params = fillPlaceholders(query.params, placeholderValues ?? {});
@@ -216,6 +270,21 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 		return this.mapAllResult(rows);
 	}
 
+	private async allRqbV2(placeholderValues?: Record<string, unknown>): Promise<T['all']> {
+		const { logger, query, tx, client, customResultMapper } = this;
+
+		const params = fillPlaceholders(query.params, placeholderValues ?? {});
+		logger.logQuery(query.sql, params);
+		const stmt: InStatement = { sql: query.sql, args: params as InArgs };
+
+		const rows = await (tx ?? client).execute(stmt).then(({ rows }) => rows.map((row) => normalizeRow(row)));
+
+		return (customResultMapper as (
+			rows: Record<string, unknown>[],
+			mapColumnValue?: (value: unknown) => unknown,
+		) => unknown)(rows as Record<string, unknown>[], normalizeFieldValue) as T['all'];
+	}
+
 	override mapAllResult(rows: unknown, isFromBatch?: boolean): unknown {
 		if (isFromBatch) {
 			rows = (rows as ResultSet).rows;
@@ -225,20 +294,34 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 			return (rows as unknown[]).map((row) => normalizeRow(row));
 		}
 
-		if (this.customResultMapper) {
-			return this.customResultMapper(rows as unknown[][], normalizeFieldValue) as T['all'];
+		if (this.isRqbV2Query) {
+			return this.useJitMappers
+				? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['all']>
+					?? makeJitRqbMapper<T['all']>(this.rqbConfig!, normalizeFieldValue))(rows as Record<string, unknown>[])
+				: (this.customResultMapper as (
+					rows: Record<string, unknown>[],
+					mapColumnValue?: (value: unknown) => unknown,
+				) => unknown)(rows as Record<string, unknown>[], normalizeFieldValue);
 		}
 
-		return (rows as unknown[]).map((row) => {
-			return mapResultRow(
-				this.fields!,
-				Array.prototype.slice.call(row).map((v) => normalizeFieldValue(v)),
-				this.joinsNotNullableMap,
-			);
-		});
+		if (this.customResultMapper) {
+			return (this.customResultMapper as (
+				rows: unknown[][],
+				mapColumnValue?: (value: unknown) => unknown,
+			) => unknown)(rows as unknown[][], normalizeFieldValue) as T['all'];
+		}
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['all']>
+				?? makeJitQueryMapper<T['all']>(this.fields!, this.joinsNotNullableMap))(
+					(rows as unknown[][]).map((row) => Array.prototype.slice.call(row).map((v) => normalizeFieldValue(v))),
+				)
+			: (rows as unknown[][]).map((row) => mapResultRow(this.fields!, row, this.joinsNotNullableMap));
 	}
 
 	async get(placeholderValues?: Record<string, unknown>): Promise<T['get']> {
+		if (this.isRqbV2Query) return this.getRqbV2(placeholderValues);
+
 		const { fields, logger, query, tx, client, customResultMapper } = this;
 		if (!fields && !customResultMapper) {
 			const params = fillPlaceholders(query.params, placeholderValues ?? {});
@@ -252,6 +335,24 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 		const rows = await this.values(placeholderValues) as unknown[][];
 
 		return this.mapGetResult(rows);
+	}
+
+	private async getRqbV2(placeholderValues?: Record<string, unknown>) {
+		const { logger, query, tx, client, customResultMapper } = this;
+
+		const params = fillPlaceholders(query.params, placeholderValues ?? {});
+		logger.logQuery(query.sql, params);
+		const stmt: InStatement = { sql: query.sql, args: params as InArgs };
+
+		const { rows } = await (tx ?? client).execute(stmt);
+		if (rows[0] === undefined) return;
+
+		const row = normalizeRow((rows as unknown[])[0]);
+
+		return (customResultMapper as (
+			rows: Record<string, unknown>[],
+			mapColumnValue?: (value: unknown) => unknown,
+		) => unknown)([row] as Record<string, unknown>[], normalizeFieldValue) as T['get'];
 	}
 
 	override mapGetResult(rows: unknown, isFromBatch?: boolean): unknown {
@@ -269,15 +370,33 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 			return undefined;
 		}
 
-		if (this.customResultMapper) {
-			return this.customResultMapper(rows as unknown[][], normalizeFieldValue) as T['get'];
+		if (this.isRqbV2Query) {
+			return this.useJitMappers
+				? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['get'][]>
+					?? makeJitRqbMapper<T['get'][]>(this.rqbConfig!, normalizeFieldValue))([row as Record<string, unknown>])
+				: (this.customResultMapper as (
+					rows: Record<string, unknown>[],
+					mapColumnValue?: (value: unknown) => unknown,
+				) => unknown)([row as Record<string, unknown>], normalizeFieldValue);
 		}
 
-		return mapResultRow(
-			this.fields!,
-			Array.prototype.slice.call(row).map((v) => normalizeFieldValue(v)),
-			this.joinsNotNullableMap,
-		);
+		if (this.customResultMapper) {
+			return (this.customResultMapper as (
+				rows: unknown[][],
+				mapColumnValue?: (value: unknown) => unknown,
+			) => unknown)(rows as unknown[][], normalizeFieldValue) as T['get'];
+		}
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['get'][]>
+				?? makeJitQueryMapper<T['get'][]>(this.fields!, this.joinsNotNullableMap))(
+					[Array.prototype.slice.call(row).map((v) => normalizeFieldValue(v))],
+				)[0]
+			: mapResultRow(
+				this.fields!,
+				Array.prototype.slice.call(row).map((v) => normalizeFieldValue(v)),
+				this.joinsNotNullableMap,
+			);
 	}
 
 	async values(placeholderValues?: Record<string, unknown>): Promise<T['values']> {
@@ -289,11 +408,6 @@ export class LibSQLPreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 				T['values']
 			>;
 		});
-	}
-
-	/** @internal */
-	isResponseInArrayMode(): boolean {
-		return this._isResponseInArrayMode;
 	}
 }
 
@@ -311,9 +425,9 @@ function normalizeRow(obj: any) {
 }
 
 function normalizeFieldValue(value: unknown) {
-	if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) { // eslint-disable-line no-instanceof/no-instanceof
+	if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) { // oxlint-disable-line drizzle-internal/no-instanceof
 		if (typeof Buffer !== 'undefined') {
-			if (!(value instanceof Buffer)) { // eslint-disable-line no-instanceof/no-instanceof
+			if (!(value instanceof Buffer)) { // oxlint-disable-line drizzle-internal/no-instanceof
 				return Buffer.from(value);
 			}
 			return value;

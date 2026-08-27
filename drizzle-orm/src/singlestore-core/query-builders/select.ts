@@ -44,6 +44,7 @@ import type {
 	SelectedFields,
 	SetOperatorRightSelect,
 	SingleStoreCreateSetOperatorFn,
+	SingleStoreCrossJoinFn,
 	SingleStoreJoinFn,
 	SingleStoreSelectConfig,
 	SingleStoreSelectDynamic,
@@ -210,7 +211,9 @@ export abstract class SingleStoreSelectQueryBuilderBase<
 	>(
 		joinType: TJoinType,
 		lateral: TIsLateral,
-	): SingleStoreJoinFn<this, TDynamic, TJoinType, TIsLateral> {
+	): 'cross' extends TJoinType ? SingleStoreCrossJoinFn<this, TDynamic, TIsLateral>
+		: SingleStoreJoinFn<this, TDynamic, TJoinType, TIsLateral>
+	{
 		return (
 			table: SingleStoreTable | Subquery | SQL, // | SingleStoreViewBase
 			on?: ((aliases: TSelection) => SQL | undefined) | SQL | undefined,
@@ -902,8 +905,7 @@ export abstract class SingleStoreSelectQueryBuilderBase<
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 
 	as<TAlias extends string>(
@@ -925,6 +927,11 @@ export abstract class SingleStoreSelectQueryBuilderBase<
 			this.config.fields,
 			new SelectionProxyHandler({ alias: this.tableName, sqlAliasedBehavior: 'alias', sqlBehavior: 'error' }),
 		) as this['_']['selectedFields'];
+	}
+
+	/** @internal */
+	override withoutSelectionCastCodecs(): this {
+		return this;
 	}
 
 	$dynamic(): SingleStoreSelectDynamic<this> {
@@ -1002,10 +1009,10 @@ export class SingleStoreSelectBase<
 
 	$withCache(config?: { config?: CacheConfig; tag?: string; autoInvalidate?: boolean } | false) {
 		this.cacheConfig = config === undefined
-			? { config: {}, enable: true, autoInvalidate: true }
+			? { config: {}, enabled: true, autoInvalidate: true }
 			: config === false
-			? { enable: false }
-			: { enable: true, autoInvalidate: true, ...config };
+			? { enabled: false }
+			: { enabled: true, autoInvalidate: true, ...config };
 		return this;
 	}
 

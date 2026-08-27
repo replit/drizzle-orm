@@ -1,8 +1,14 @@
 import type { SQLiteDatabase, SQLiteRunResult, SQLiteStatement } from 'expo-sqlite';
+import type * as V1 from '~/_relations.ts';
 import { entityKind } from '~/entity.ts';
 import type { Logger } from '~/logger.ts';
 import { NoopLogger } from '~/logger.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import { fillPlaceholders, type Query, sql } from '~/sql/sql.ts';
 import type { SQLiteSyncDialect } from '~/sqlite-core/dialect.ts';
 import { SQLiteTransaction } from '~/sqlite-core/index.ts';
@@ -14,18 +20,20 @@ import {
 	SQLiteSession,
 	type SQLiteTransactionConfig,
 } from '~/sqlite-core/session.ts';
-import { mapResultRow } from '~/utils.ts';
+import { type DrizzleTypeError, makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 
 export interface ExpoSQLiteSessionOptions {
 	logger?: Logger;
+	useJitMappers?: boolean;
 }
 
 type PreparedQueryConfig = Omit<PreparedQueryConfigBase, 'statement' | 'run'>;
 
 export class ExpoSQLiteSession<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteSession<'sync', SQLiteRunResult, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteSession<'sync', SQLiteRunResult, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'ExpoSQLiteSession';
 
 	private logger: Logger;
@@ -33,8 +41,9 @@ export class ExpoSQLiteSession<
 	constructor(
 		private client: SQLiteDatabase,
 		dialect: SQLiteSyncDialect,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
-		options: ExpoSQLiteSessionOptions = {},
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
+		private options: ExpoSQLiteSessionOptions = {},
 	) {
 		super(dialect);
 		this.logger = options.logger ?? new NoopLogger();
@@ -44,7 +53,6 @@ export class ExpoSQLiteSession<
 		query: Query,
 		fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		isResponseInArrayMode: boolean,
 		customResultMapper?: (rows: unknown[][]) => unknown,
 	): ExpoSQLitePreparedQuery<T> {
 		const stmt = this.client.prepareSync(query.sql);
@@ -54,16 +62,37 @@ export class ExpoSQLiteSession<
 			this.logger,
 			fields,
 			executeMethod,
-			isResponseInArrayMode,
+			this.options.useJitMappers,
 			customResultMapper,
 		);
 	}
 
+	prepareRelationalQuery<T extends Omit<PreparedQueryConfig, 'run'>>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		executeMethod: SQLiteExecuteMethod,
+		customResultMapper: (rows: Record<string, unknown>[]) => unknown,
+		config: RelationalQueryMapperConfig,
+	): ExpoSQLitePreparedQuery<T, true> {
+		const stmt = this.client.prepareSync(query.sql);
+		return new ExpoSQLitePreparedQuery(
+			stmt,
+			query,
+			this.logger,
+			fields,
+			executeMethod,
+			this.options.useJitMappers,
+			customResultMapper,
+			true,
+			config,
+		);
+	}
+
 	override transaction<T>(
-		transaction: (tx: ExpoSQLiteTransaction<TFullSchema, TSchema>) => T,
+		transaction: (tx: ExpoSQLiteTransaction<TFullSchema, TRelations, TSchema>) => T,
 		config: SQLiteTransactionConfig = {},
 	): T {
-		const tx = new ExpoSQLiteTransaction('sync', this.dialect, this, this.schema);
+		const tx = new ExpoSQLiteTransaction('sync', this.dialect, this, this.relations, this.schema);
 		this.run(sql.raw(`begin${config?.behavior ? ' ' + config.behavior : ''}`));
 		try {
 			const result = transaction(tx);
@@ -78,18 +107,31 @@ export class ExpoSQLiteSession<
 
 export class ExpoSQLiteTransaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteTransaction<'sync', SQLiteRunResult, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteTransaction<'sync', SQLiteRunResult, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'ExpoSQLiteTransaction';
 
-	override transaction<T>(transaction: (tx: ExpoSQLiteTransaction<TFullSchema, TSchema>) => T): T {
+	override transaction<T>(
+		transaction: (
+			tx: ExpoSQLiteTransaction<TFullSchema, TRelations, TSchema>,
+		) => T extends Promise<any> ? DrizzleTypeError<"Sync drivers can't use async functions in transactions!">
+			: T,
+	): T {
 		const savepointName = `sp${this.nestedIndex}`;
-		const tx = new ExpoSQLiteTransaction('sync', this.dialect, this.session, this.schema, this.nestedIndex + 1);
+		const tx = new ExpoSQLiteTransaction(
+			'sync',
+			this.dialect,
+			this.session,
+			this.relations,
+			this.schema,
+			this.nestedIndex + 1,
+		);
 		this.session.run(sql.raw(`savepoint ${savepointName}`));
 		try {
 			const result = transaction(tx);
 			this.session.run(sql.raw(`release savepoint ${savepointName}`));
-			return result;
+			return result as T;
 		} catch (err) {
 			this.session.run(sql.raw(`rollback to savepoint ${savepointName}`));
 			throw err;
@@ -97,10 +139,14 @@ export class ExpoSQLiteTransaction<
 	}
 }
 
-export class ExpoSQLitePreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> extends SQLitePreparedQuery<
+export class ExpoSQLitePreparedQuery<
+	T extends PreparedQueryConfig = PreparedQueryConfig,
+	TIsRqbV2 extends boolean = false,
+> extends SQLitePreparedQuery<
 	{ type: 'sync'; run: SQLiteRunResult; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
 > {
 	static override readonly [entityKind]: string = 'ExpoSQLitePreparedQuery';
+	private jitMapper?: RowsMapper<any> | RelationalRowsMapper<any>;
 
 	constructor(
 		private stmt: SQLiteStatement,
@@ -108,8 +154,12 @@ export class ExpoSQLitePreparedQuery<T extends PreparedQueryConfig = PreparedQue
 		private logger: Logger,
 		private fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		private _isResponseInArrayMode: boolean,
-		private customResultMapper?: (rows: unknown[][]) => unknown,
+		private useJitMappers: boolean | undefined,
+		private customResultMapper?: (
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
+		) => unknown,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super('sync', executeMethod, query);
 	}
@@ -125,6 +175,8 @@ export class ExpoSQLitePreparedQuery<T extends PreparedQueryConfig = PreparedQue
 	}
 
 	all(placeholderValues?: Record<string, unknown>): T['all'] {
+		if (this.isRqbV2Query) return this.allRqbV2(placeholderValues);
+
 		const { fields, joinsNotNullableMap, query, logger, stmt, customResultMapper } = this;
 		if (!fields && !customResultMapper) {
 			const params = fillPlaceholders(query.params, placeholderValues ?? {});
@@ -134,12 +186,30 @@ export class ExpoSQLitePreparedQuery<T extends PreparedQueryConfig = PreparedQue
 
 		const rows = this.values(placeholderValues) as unknown[][];
 		if (customResultMapper) {
-			return customResultMapper(rows) as T['all'];
+			return (customResultMapper as (rows: unknown[][]) => unknown)(rows) as T['all'];
 		}
-		return rows.map((row) => mapResultRow(fields!, row, joinsNotNullableMap));
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['all']>
+				?? makeJitQueryMapper<T['all']>(fields!, joinsNotNullableMap))(rows)
+			: rows.map((row) => mapResultRow(fields!, row, joinsNotNullableMap));
+	}
+
+	private allRqbV2(placeholderValues?: Record<string, unknown>): T['all'] {
+		const { query, logger, stmt, customResultMapper } = this;
+		const params = fillPlaceholders(query.params, placeholderValues ?? {});
+		logger.logQuery(query.sql, params);
+		const rows = stmt.executeSync(params as any[]).getAllSync() as Record<string, unknown>[];
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['all']>
+				?? makeJitRqbMapper<T['all']>(this.rqbConfig!))(rows)
+			: (customResultMapper as (rows: Record<string, unknown>[]) => unknown)(rows) as T['all'];
 	}
 
 	get(placeholderValues?: Record<string, unknown>): T['get'] {
+		if (this.isRqbV2Query) return this.getRqbV2(placeholderValues);
+
 		const params = fillPlaceholders(this.query.params, placeholderValues ?? {});
 		this.logger.logQuery(this.query.sql, params);
 
@@ -156,20 +226,37 @@ export class ExpoSQLitePreparedQuery<T extends PreparedQueryConfig = PreparedQue
 		}
 
 		if (customResultMapper) {
-			return customResultMapper(rows) as T['get'];
+			return (customResultMapper as (rows: unknown[][]) => unknown)(rows) as T['get'];
 		}
 
-		return mapResultRow(fields!, row, joinsNotNullableMap);
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['get'][]>
+				?? makeJitQueryMapper<T['get'][]>(fields!, joinsNotNullableMap))(
+					[row],
+				)[0]
+			: mapResultRow(this.fields!, row, this.joinsNotNullableMap);
+	}
+
+	private getRqbV2(placeholderValues?: Record<string, unknown>): T['get'] {
+		const params = fillPlaceholders(this.query.params, placeholderValues ?? {});
+		this.logger.logQuery(this.query.sql, params);
+
+		const { stmt, customResultMapper } = this;
+		const row = stmt.executeSync(params as any[]).getFirstSync() as Record<string, unknown> | undefined;
+
+		if (!row) {
+			return undefined;
+		}
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['get'][]>
+				?? makeJitRqbMapper<T['get'][]>(this.rqbConfig!))([row])
+			: (customResultMapper as (rows: Record<string, unknown>[]) => unknown)([row]) as T['get'];
 	}
 
 	values(placeholderValues?: Record<string, unknown>): T['values'] {
 		const params = fillPlaceholders(this.query.params, placeholderValues ?? {});
 		this.logger.logQuery(this.query.sql, params);
 		return this.stmt.executeForRawResultSync(params as any[]).getAllSync();
-	}
-
-	/** @internal */
-	isResponseInArrayMode(): boolean {
-		return this._isResponseInArrayMode;
 	}
 }

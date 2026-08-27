@@ -10,6 +10,7 @@ import type {
 	RowDataPacket,
 } from 'mysql2/promise';
 import { once } from 'node:events';
+import type * as V1 from '~/_relations.ts';
 import { type Cache, NoopCache } from '~/cache/core/index.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { Column } from '~/column.ts';
@@ -29,10 +30,15 @@ import {
 	type MySqlTransactionConfig,
 	type PreparedQueryKind,
 } from '~/mysql-core/session.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import { fillPlaceholders, sql } from '~/sql/sql.ts';
 import type { Query, SQL } from '~/sql/sql.ts';
-import { type Assume, mapResultRow } from '~/utils.ts';
+import { type Assume, makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 
 export type MySql2Client = Pool | Connection;
 
@@ -42,11 +48,16 @@ export type MySqlQueryResult<
 	T = any,
 > = [T extends ResultSetHeader ? T : T[], FieldPacket[]];
 
-export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig> extends MySqlPreparedQuery<T> {
+export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig, TIsRqbV2 extends boolean = false>
+	extends MySqlPreparedQuery<T>
+{
 	static override readonly [entityKind]: string = 'MySql2PreparedQuery';
 
 	private rawQuery: QueryOptions;
 	private query: QueryOptions;
+	private jitMapper?:
+		| RowsMapper<(T['execute'] extends any[] ? T['execute'][number] : T['execute'])[]>
+		| RelationalRowsMapper<T['execute']>;
 
 	constructor(
 		private client: MySql2Client,
@@ -60,11 +71,16 @@ export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig> extends MyS
 		} | undefined,
 		cacheConfig: WithCacheConfig | undefined,
 		private fields: SelectedFieldsOrdered | undefined,
-		private customResultMapper?: (rows: unknown[][]) => T['execute'],
+		private useJitMappers: boolean | undefined,
+		private customResultMapper?: (
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
+		) => T['execute'],
 		// Keys that were used in $default and the value that was generated for them
 		private generatedIds?: Record<string, unknown>[],
 		// Keys that should be returned, it has the column with all properries + key from object
 		private returningIds?: SelectedFieldsOrdered,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super(cache, queryMetadata, cacheConfig);
 		this.rawQuery = {
@@ -90,6 +106,8 @@ export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig> extends MyS
 	}
 
 	async execute(placeholderValues: Record<string, unknown> = {}): Promise<T['execute']> {
+		if (this.isRqbV2Query) return this.executeRqbV2(placeholderValues);
+
 		const params = fillPlaceholders(this.params, placeholderValues);
 
 		this.logger.logQuery(this.rawQuery.sql, params);
@@ -139,7 +157,25 @@ export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig> extends MyS
 			return customResultMapper(rows);
 		}
 
-		return rows.map((row) => mapResultRow<T['execute']>(fields!, row, joinsNotNullableMap));
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<(T['execute'] extends any[] ? T['execute'][number]
+				: T['execute'])[]>
+				?? makeJitQueryMapper<(T['execute'] extends any[] ? T['execute'][number]
+					: T['execute'])[]>(fields!, joinsNotNullableMap))(rows)
+			: rows.map((row) => mapResultRow(fields!, row, joinsNotNullableMap));
+	}
+
+	private async executeRqbV2(placeholderValues: Record<string, unknown> = {}): Promise<T['execute']> {
+		const params = fillPlaceholders(this.params, placeholderValues);
+
+		this.logger.logQuery(this.rawQuery.sql, params);
+
+		const { client, rawQuery, customResultMapper } = this;
+		const res = await client.query<any>(rawQuery, params);
+
+		const rows = res[0];
+
+		return (customResultMapper as (rows: Record<string, unknown>[]) => T['execute'])(rows);
 	}
 
 	async *iterator(
@@ -171,15 +207,33 @@ export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig> extends MyS
 				const row = await Promise.race([onEnd, onError, new Promise((resolve) => stream.once('data', resolve))]);
 				if (row === undefined || (Array.isArray(row) && row.length === 0)) {
 					break;
-				} else if (row instanceof Error) { // eslint-disable-line no-instanceof/no-instanceof
+				} else if (row instanceof Error) { // oxlint-disable-line drizzle-internal/no-instanceof
 					throw row;
 				} else {
-					if (hasRowsMapper) {
+					if (this.isRqbV2Query) {
+						if (this.useJitMappers) {
+							yield (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['execute']>
+								?? makeJitRqbMapper<T['execute']>(this.rqbConfig!))([row as Record<string, unknown>]);
+						} else {
+							const mapped = (customResultMapper as (rows: Record<string, unknown>[]) => T['execute'])(
+								[row] as Record<string, unknown>[],
+							);
+							if (this.rqbConfig!.isFirst) yield mapped;
+							else yield ((<any[]> mapped)[0]);
+						}
+					} else if (hasRowsMapper) {
 						if (customResultMapper) {
-							const mappedRow = customResultMapper([row as unknown[]]);
+							const mappedRow = (customResultMapper as (rows: unknown[][]) => T['execute'])([row as unknown[]]);
 							yield (Array.isArray(mappedRow) ? mappedRow[0] : mappedRow);
 						} else {
-							yield mapResultRow(fields!, row as unknown[], joinsNotNullableMap);
+							yield this.useJitMappers
+								? (this.jitMapper = this.jitMapper as RowsMapper<(T['execute'] extends any[] ? T['execute'][number]
+									: T['execute'])[]>
+									?? makeJitQueryMapper<(T['execute'] extends any[] ? T['execute'][number] : T['execute'])[]>(
+										fields!,
+										joinsNotNullableMap,
+									))([row as unknown[]])[0] as T['execute']
+								: mapResultRow(fields!, row as unknown[], joinsNotNullableMap);
 						}
 					} else {
 						yield row as T['execute'];
@@ -198,13 +252,15 @@ export class MySql2PreparedQuery<T extends MySqlPreparedQueryConfig> extends MyS
 export interface MySql2SessionOptions {
 	logger?: Logger;
 	cache?: Cache;
+	useJitMappers?: boolean;
 	mode: Mode;
 }
 
 export class MySql2Session<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends MySqlSession<MySqlQueryResultHKT, MySql2PreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends MySqlSession<MySqlQueryResultHKT, MySql2PreparedQueryHKT, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'MySql2Session';
 
 	private logger: Logger;
@@ -214,7 +270,8 @@ export class MySql2Session<
 	constructor(
 		private client: MySql2Client,
 		dialect: MySqlDialect,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
 		private options: MySql2SessionOptions,
 	) {
 		super(dialect);
@@ -246,10 +303,39 @@ export class MySql2Session<
 			queryMetadata,
 			cacheConfig,
 			fields,
+			this.options.useJitMappers,
 			customResultMapper,
 			generatedIds,
 			returningIds,
 		) as PreparedQueryKind<MySql2PreparedQueryHKT, T>;
+	}
+
+	prepareRelationalQuery<T extends MySqlPreparedQueryConfig>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		customResultMapper: (rows: Record<string, unknown>[]) => T['execute'],
+		config: RelationalQueryMapperConfig,
+		generatedIds?: Record<string, unknown>[],
+		returningIds?: SelectedFieldsOrdered,
+	): PreparedQueryKind<MySql2PreparedQueryHKT, T> {
+		// Add returningId fields
+		// Each driver gets them from response from database
+		return new MySql2PreparedQuery(
+			this.client,
+			query.sql,
+			query.params,
+			this.logger,
+			this.cache,
+			undefined,
+			undefined,
+			fields,
+			this.options.useJitMappers,
+			customResultMapper,
+			generatedIds,
+			returningIds,
+			true,
+			config,
+		) as any;
 	}
 
 	/**
@@ -275,24 +361,26 @@ export class MySql2Session<
 	override all<T = unknown>(query: SQL): Promise<T[]> {
 		const querySql = this.dialect.sqlToQuery(query);
 		this.logger.logQuery(querySql.sql, querySql.params);
-		return this.client.execute(querySql.sql, querySql.params).then((result) => result[0]) as Promise<T[]>;
+		return this.client.query(querySql.sql, querySql.params).then((result) => result[0]) as Promise<T[]>;
 	}
 
 	override async transaction<T>(
-		transaction: (tx: MySql2Transaction<TFullSchema, TSchema>) => Promise<T>,
+		transaction: (tx: MySql2Transaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 		config?: MySqlTransactionConfig,
 	): Promise<T> {
 		const session = isPool(this.client)
 			? new MySql2Session(
 				await this.client.getConnection(),
 				this.dialect,
+				this.relations,
 				this.schema,
 				this.options,
 			)
 			: this;
-		const tx = new MySql2Transaction<TFullSchema, TSchema>(
+		const tx = new MySql2Transaction<TFullSchema, TRelations, TSchema>(
 			this.dialect,
-			session as MySqlSession<any, any, any, any>,
+			session as MySqlSession<any, any, any, any, any>,
+			this.relations,
 			this.schema,
 			0,
 			this.mode,
@@ -324,15 +412,25 @@ export class MySql2Session<
 
 export class MySql2Transaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends MySqlTransaction<MySql2QueryResultHKT, MySql2PreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends MySqlTransaction<
+	MySql2QueryResultHKT,
+	MySql2PreparedQueryHKT,
+	TFullSchema,
+	TRelations,
+	TSchema
+> {
 	static override readonly [entityKind]: string = 'MySql2Transaction';
 
-	override async transaction<T>(transaction: (tx: MySql2Transaction<TFullSchema, TSchema>) => Promise<T>): Promise<T> {
+	override async transaction<T>(
+		transaction: (tx: MySql2Transaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
+	): Promise<T> {
 		const savepointName = `sp${this.nestedIndex + 1}`;
-		const tx = new MySql2Transaction<TFullSchema, TSchema>(
+		const tx = new MySql2Transaction<TFullSchema, TRelations, TSchema>(
 			this.dialect,
 			this.session,
+			this.relations,
 			this.schema,
 			this.nestedIndex + 1,
 			this.mode,

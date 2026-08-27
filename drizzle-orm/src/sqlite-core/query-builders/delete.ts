@@ -148,7 +148,7 @@ export class SQLiteDeleteBase<
 
 	constructor(
 		private table: TTable,
-		private session: SQLiteSession<any, any, any, any>,
+		private session: SQLiteSession<any, any, any, any, any>,
 		private dialect: SQLiteDialect,
 		withList?: Subquery[],
 	) {
@@ -247,7 +247,7 @@ export class SQLiteDeleteBase<
 	): SQLiteDeleteReturning<this, TDynamic, TSelectedFields>;
 	returning(
 		fields: SelectedFieldsFlat = this.table[SQLiteTable.Symbol.Columns],
-	): SQLiteDeleteReturning<this, TDynamic, any> {
+	): SQLiteDeleteReturning<this, TDynamic, any> | SQLiteDeleteReturningAll<this, TDynamic> {
 		this.config.returning = orderSelectedFields<SQLiteColumn>(fields);
 		return this as any;
 	}
@@ -258,8 +258,7 @@ export class SQLiteDeleteBase<
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 
 	/** @internal */
@@ -268,7 +267,6 @@ export class SQLiteDeleteBase<
 			this.dialect.sqlToQuery(this.getSQL()),
 			this.config.returning,
 			this.config.returning ? 'all' : 'run',
-			true,
 			undefined,
 			{
 				type: 'delete',

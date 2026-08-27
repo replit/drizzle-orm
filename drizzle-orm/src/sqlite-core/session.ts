@@ -1,10 +1,10 @@
+import type * as V1 from '~/_relations.ts';
 import { type Cache, hashQuery, NoopCache } from '~/cache/core/cache.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { entityKind, is } from '~/entity.ts';
-import { DrizzleError, TransactionRollbackError } from '~/errors.ts';
-import { DrizzleQueryError } from '~/errors/index.ts';
+import { DrizzleError, DrizzleQueryError, TransactionRollbackError } from '~/errors.ts';
 import { QueryPromise } from '~/query-promise.ts';
-import type { TablesRelationalConfig } from '~/relations.ts';
+import type { AnyRelations, EmptyRelations, RelationalQueryMapperConfig } from '~/relations.ts';
 import type { PreparedQuery } from '~/session.ts';
 import type { Query, SQL } from '~/sql/sql.ts';
 import type { SQLiteAsyncDialect, SQLiteSyncDialect } from '~/sqlite-core/dialect.ts';
@@ -61,9 +61,9 @@ export abstract class SQLitePreparedQuery<T extends PreparedQueryConfig> impleme
 	) {
 		// it means that no $withCache options were passed and it should be just enabled
 		if (cache && cache.strategy() === 'all' && cacheConfig === undefined) {
-			this.cacheConfig = { enable: true, autoInvalidate: true };
+			this.cacheConfig = { enabled: true, autoInvalidate: true };
 		}
-		if (!this.cacheConfig?.enable) {
+		if (!this.cacheConfig?.enabled) {
 			this.cacheConfig = undefined;
 		}
 	}
@@ -83,7 +83,7 @@ export abstract class SQLitePreparedQuery<T extends PreparedQueryConfig> impleme
 		}
 
 		// don't do any mutations, if globally is false
-		if (this.cacheConfig && !this.cacheConfig.enable) {
+		if (this.cacheConfig && !this.cacheConfig.enabled) {
 			try {
 				return await query();
 			} catch (e) {
@@ -199,9 +199,6 @@ export abstract class SQLitePreparedQuery<T extends PreparedQueryConfig> impleme
 			}
 		}
 	}
-
-	/** @internal */
-	abstract isResponseInArrayMode(): boolean;
 }
 
 export interface SQLiteTransactionConfig {
@@ -213,8 +210,9 @@ export type SQLiteExecuteMethod = 'run' | 'all' | 'get';
 export abstract class SQLiteSession<
 	TResultKind extends 'sync' | 'async',
 	TRunResult,
-	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
+	TFullSchema extends Record<string, unknown> = Record<string, never>,
+	TRelations extends AnyRelations = EmptyRelations,
+	TSchema extends V1.TablesRelationalConfig = V1.ExtractTablesWithRelations<TFullSchema>,
 > {
 	static readonly [entityKind]: string = 'SQLiteSession';
 
@@ -227,7 +225,6 @@ export abstract class SQLiteSession<
 		query: Query,
 		fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		isResponseInArrayMode: boolean,
 		customResultMapper?: (rows: unknown[][], mapColumnValue?: (value: unknown) => unknown) => unknown,
 		queryMetadata?: {
 			type: 'select' | 'update' | 'delete' | 'insert';
@@ -240,7 +237,6 @@ export abstract class SQLiteSession<
 		query: Query,
 		fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		isResponseInArrayMode: boolean,
 		customResultMapper?: (rows: unknown[][], mapColumnValue?: (value: unknown) => unknown) => unknown,
 		queryMetadata?: {
 			type: 'select' | 'update' | 'delete' | 'insert';
@@ -252,22 +248,41 @@ export abstract class SQLiteSession<
 			query,
 			fields,
 			executeMethod,
-			isResponseInArrayMode,
 			customResultMapper,
 			queryMetadata,
 			cacheConfig,
 		);
 	}
 
+	abstract prepareRelationalQuery(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		executeMethod: SQLiteExecuteMethod,
+		customResultMapper: (rows: Record<string, unknown>[], mapColumnValue?: (value: unknown) => unknown) => unknown,
+		config: RelationalQueryMapperConfig,
+	): SQLitePreparedQuery<PreparedQueryConfig & { type: TResultKind }>;
+
+	prepareOneTimeRelationalQuery(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		executeMethod: SQLiteExecuteMethod,
+		customResultMapper: (rows: Record<string, unknown>[], mapColumnValue?: (value: unknown) => unknown) => unknown,
+		config: RelationalQueryMapperConfig,
+	): SQLitePreparedQuery<PreparedQueryConfig & { type: TResultKind }> {
+		return this.prepareRelationalQuery(query, fields, executeMethod, customResultMapper, config);
+	}
+
 	abstract transaction<T>(
-		transaction: (tx: SQLiteTransaction<TResultKind, TRunResult, TFullSchema, TSchema>) => Result<TResultKind, T>,
+		transaction: (
+			tx: SQLiteTransaction<TResultKind, TRunResult, TFullSchema, TRelations, TSchema>,
+		) => Result<TResultKind, T>,
 		config?: SQLiteTransactionConfig,
 	): Result<TResultKind, T>;
 
 	run(query: SQL): Result<TResultKind, TRunResult> {
 		const staticQuery = this.dialect.sqlToQuery(query);
 		try {
-			return this.prepareOneTimeQuery(staticQuery, undefined, 'run', false).run() as Result<TResultKind, TRunResult>;
+			return this.prepareOneTimeQuery(staticQuery, undefined, 'run').run() as Result<TResultKind, TRunResult>;
 		} catch (err) {
 			throw new DrizzleError({ cause: err, message: `Failed to run the query '${staticQuery.sql}'` });
 		}
@@ -279,7 +294,7 @@ export abstract class SQLiteSession<
 	}
 
 	all<T = unknown>(query: SQL): Result<TResultKind, T[]> {
-		return this.prepareOneTimeQuery(this.dialect.sqlToQuery(query), undefined, 'run', false).all() as Result<
+		return this.prepareOneTimeQuery(this.dialect.sqlToQuery(query), undefined, 'run').all() as Result<
 			TResultKind,
 			T[]
 		>;
@@ -291,7 +306,7 @@ export abstract class SQLiteSession<
 	}
 
 	get<T = unknown>(query: SQL): Result<TResultKind, T> {
-		return this.prepareOneTimeQuery(this.dialect.sqlToQuery(query), undefined, 'run', false).get() as Result<
+		return this.prepareOneTimeQuery(this.dialect.sqlToQuery(query), undefined, 'run').get() as Result<
 			TResultKind,
 			T
 		>;
@@ -305,7 +320,7 @@ export abstract class SQLiteSession<
 	values<T extends any[] = unknown[]>(
 		query: SQL,
 	): Result<TResultKind, T[]> {
-		return this.prepareOneTimeQuery(this.dialect.sqlToQuery(query), undefined, 'run', false).values() as Result<
+		return this.prepareOneTimeQuery(this.dialect.sqlToQuery(query), undefined, 'run').values() as Result<
 			TResultKind,
 			T[]
 		>;
@@ -330,23 +345,27 @@ export type DBResult<TKind extends 'sync' | 'async', TResult> = { sync: TResult;
 export abstract class SQLiteTransaction<
 	TResultType extends 'sync' | 'async',
 	TRunResult,
-	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends BaseSQLiteDatabase<TResultType, TRunResult, TFullSchema, TSchema> {
+	TFullSchema extends Record<string, unknown> = Record<string, never>,
+	TRelations extends AnyRelations = EmptyRelations,
+	TSchema extends V1.TablesRelationalConfig = V1.ExtractTablesWithRelations<TFullSchema>,
+> extends BaseSQLiteDatabase<TResultType, TRunResult, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'SQLiteTransaction';
 
 	constructor(
 		resultType: TResultType,
 		dialect: { sync: SQLiteSyncDialect; async: SQLiteAsyncDialect }[TResultType],
-		session: SQLiteSession<TResultType, TRunResult, TFullSchema, TSchema>,
+		session: SQLiteSession<TResultType, TRunResult, TFullSchema, TRelations, TSchema>,
+		protected relations: TRelations,
 		protected schema: {
 			fullSchema: Record<string, unknown>;
 			schema: TSchema;
 			tableNamesMap: Record<string, string>;
 		} | undefined,
 		protected readonly nestedIndex = 0,
+		rowModeRQB?: boolean,
+		forbidJsonb?: boolean,
 	) {
-		super(resultType, dialect, session, schema);
+		super(resultType, dialect, session, relations, schema, rowModeRQB, forbidJsonb);
 	}
 
 	rollback(): never {

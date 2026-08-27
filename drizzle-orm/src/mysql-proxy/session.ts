@@ -1,4 +1,5 @@
 import type { FieldPacket, ResultSetHeader } from 'mysql2/promise';
+import type * as V1 from '~/_relations.ts';
 import { type Cache, NoopCache } from '~/cache/core/index.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { Column } from '~/column.ts';
@@ -16,10 +17,15 @@ import type {
 	PreparedQueryKind,
 } from '~/mysql-core/session.ts';
 import { MySqlPreparedQuery as PreparedQueryBase, MySqlSession } from '~/mysql-core/session.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import { fillPlaceholders } from '~/sql/sql.ts';
 import type { Query, SQL } from '~/sql/sql.ts';
-import { type Assume, mapResultRow } from '~/utils.ts';
+import { type Assume, makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 import type { RemoteCallback } from './driver.ts';
 
 export type MySqlRawQueryResult = [ResultSetHeader, FieldPacket[]];
@@ -27,12 +33,20 @@ export type MySqlRawQueryResult = [ResultSetHeader, FieldPacket[]];
 export interface MySqlRemoteSessionOptions {
 	logger?: Logger;
 	cache?: Cache;
+	useJitMappers?: boolean;
 }
 
 export class MySqlRemoteSession<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends MySqlSession<MySqlRemoteQueryResultHKT, MySqlRemotePreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends MySqlSession<
+	MySqlRemoteQueryResultHKT,
+	MySqlRemotePreparedQueryHKT,
+	TFullSchema,
+	TRelations,
+	TSchema
+> {
 	static override readonly [entityKind]: string = 'MySqlRemoteSession';
 
 	private logger: Logger;
@@ -41,8 +55,9 @@ export class MySqlRemoteSession<
 	constructor(
 		private client: RemoteCallback,
 		dialect: MySqlDialect,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
-		options: MySqlRemoteSessionOptions,
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
+		private options: MySqlRemoteSessionOptions,
 	) {
 		super(dialect);
 		this.logger = options.logger ?? new NoopLogger();
@@ -70,10 +85,37 @@ export class MySqlRemoteSession<
 			queryMetadata,
 			cacheConfig,
 			fields,
+			this.options.useJitMappers,
 			customResultMapper,
 			generatedIds,
 			returningIds,
 		) as PreparedQueryKind<MySqlRemotePreparedQueryHKT, T>;
+	}
+
+	prepareRelationalQuery<T extends MySqlPreparedQueryConfig>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		customResultMapper: (rows: Record<string, unknown>[]) => T['execute'],
+		config: RelationalQueryMapperConfig,
+		generatedIds?: Record<string, unknown>[],
+		returningIds?: SelectedFieldsOrdered,
+	): PreparedQueryKind<MySqlRemotePreparedQueryHKT, T> {
+		return new PreparedQuery(
+			this.client,
+			query.sql,
+			query.params,
+			this.logger,
+			this.cache,
+			undefined,
+			undefined,
+			fields,
+			this.options.useJitMappers,
+			customResultMapper,
+			generatedIds,
+			returningIds,
+			true,
+			config,
+		) as any;
 	}
 
 	override all<T = unknown>(query: SQL): Promise<T[]> {
@@ -83,7 +125,7 @@ export class MySqlRemoteSession<
 	}
 
 	override async transaction<T>(
-		_transaction: (tx: MySqlProxyTransaction<TFullSchema, TSchema>) => Promise<T>,
+		_transaction: (tx: MySqlProxyTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 		_config?: MySqlTransactionConfig,
 	): Promise<T> {
 		throw new Error('Transactions are not supported by the MySql Proxy driver');
@@ -92,19 +134,29 @@ export class MySqlRemoteSession<
 
 export class MySqlProxyTransaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends MySqlTransaction<MySqlRemoteQueryResultHKT, MySqlRemotePreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends MySqlTransaction<
+	MySqlRemoteQueryResultHKT,
+	MySqlRemotePreparedQueryHKT,
+	TFullSchema,
+	TRelations,
+	TSchema
+> {
 	static override readonly [entityKind]: string = 'MySqlProxyTransaction';
 
 	override async transaction<T>(
-		_transaction: (tx: MySqlProxyTransaction<TFullSchema, TSchema>) => Promise<T>,
+		_transaction: (tx: MySqlProxyTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 	): Promise<T> {
 		throw new Error('Transactions are not supported by the MySql Proxy driver');
 	}
 }
 
-export class PreparedQuery<T extends MySqlPreparedQueryConfig> extends PreparedQueryBase<T> {
+export class PreparedQuery<T extends MySqlPreparedQueryConfig, TIsRqbV2 extends boolean = false>
+	extends PreparedQueryBase<T>
+{
 	static override readonly [entityKind]: string = 'MySqlProxyPreparedQuery';
+	private jitMapper?: RowsMapper<T['execute']> | RelationalRowsMapper<T['execute']>;
 
 	constructor(
 		private client: RemoteCallback,
@@ -118,16 +170,23 @@ export class PreparedQuery<T extends MySqlPreparedQueryConfig> extends PreparedQ
 		} | undefined,
 		cacheConfig: WithCacheConfig | undefined,
 		private fields: SelectedFieldsOrdered | undefined,
-		private customResultMapper?: (rows: unknown[][]) => T['execute'],
+		private useJitMappers: boolean | undefined,
+		private customResultMapper?: (
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
+		) => T['execute'],
 		// Keys that were used in $default and the value that was generated for them
 		private generatedIds?: Record<string, unknown>[],
 		// Keys that should be returned, it has the column with all properries + key from object
 		private returningIds?: SelectedFieldsOrdered,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super(cache, queryMetadata, cacheConfig);
 	}
 
 	async execute(placeholderValues: Record<string, unknown> | undefined = {}): Promise<T['execute']> {
+		if (this.isRqbV2Query) return this.executeRqbV2(placeholderValues);
+
 		const params = fillPlaceholders(this.params, placeholderValues);
 
 		const { fields, client, queryString, logger, joinsNotNullableMap, customResultMapper, returningIds, generatedIds } =
@@ -177,7 +236,26 @@ export class PreparedQuery<T extends MySqlPreparedQueryConfig> extends PreparedQ
 			return customResultMapper(rows);
 		}
 
-		return rows.map((row) => mapResultRow<T['execute']>(fields!, row, joinsNotNullableMap));
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['execute']>
+				?? makeJitQueryMapper<T['execute']>(fields!, joinsNotNullableMap))(rows)
+			: rows.map((row) => mapResultRow(fields!, row, joinsNotNullableMap));
+	}
+
+	private async executeRqbV2(placeholderValues: Record<string, unknown> | undefined = {}): Promise<T['execute']> {
+		const params = fillPlaceholders(this.params, placeholderValues);
+
+		const { client, queryString, logger, customResultMapper } = this;
+
+		logger.logQuery(queryString, params);
+
+		const { rows: res } = await client(queryString, params, 'execute');
+		const rows = res[0];
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['execute']>
+				?? makeJitRqbMapper<T['execute']>(this.rqbConfig!))(rows)
+			: customResultMapper!(rows);
 	}
 
 	override iterator(

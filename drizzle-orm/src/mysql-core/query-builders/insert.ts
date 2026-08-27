@@ -14,10 +14,10 @@ import type { MySqlTable } from '~/mysql-core/table.ts';
 import type { TypedQueryBuilder } from '~/query-builders/query-builder.ts';
 import { QueryPromise } from '~/query-promise.ts';
 import type { RunnableQuery } from '~/runnable-query.ts';
-import type { Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
+import type { Placeholder, Query, SqlCommenterInput, SQLWrapper } from '~/sql/sql.ts';
 import { Param, SQL, sql } from '~/sql/sql.ts';
-import type { InferModelFromColumns } from '~/table.ts';
-import { Columns, Table } from '~/table.ts';
+import type { InferInsertModel, InferModelFromColumns } from '~/table.ts';
+import { Table, TableColumns } from '~/table.ts';
 import { haveSameKeys, mapUpdateSet } from '~/utils.ts';
 import type { AnyMySqlColumn } from '../columns/common.ts';
 import { extractUsedTable } from '../utils.ts';
@@ -32,18 +32,25 @@ export interface MySqlInsertConfig<TTable extends MySqlTable = MySqlTable> {
 	onConflict?: SQL;
 	returning?: SelectedFieldsOrdered;
 	select?: boolean;
+	comment?: SQL;
 }
 
 export type AnyMySqlInsertConfig = MySqlInsertConfig<MySqlTable>;
 
-export type MySqlInsertValue<TTable extends MySqlTable> =
+export type MySqlInsertValue<
+	TTable extends MySqlTable,
+	TModel extends Record<string, any> = InferInsertModel<TTable>,
+> =
 	& {
-		[Key in keyof TTable['$inferInsert']]: TTable['$inferInsert'][Key] | SQL | Placeholder;
+		[Key in keyof TModel]: TModel[Key] | SQL | Placeholder;
 	}
 	& {};
 
-export type MySqlInsertSelectQueryBuilder<TTable extends MySqlTable> = TypedQueryBuilder<
-	{ [K in keyof TTable['$inferInsert']]: AnyMySqlColumn | SQL | SQL.Aliased | TTable['$inferInsert'][K] }
+export type MySqlInsertSelectQueryBuilder<
+	TTable extends MySqlTable,
+	TModel extends Record<string, any> = InferInsertModel<TTable>,
+> = TypedQueryBuilder<
+	{ [K in keyof TModel]: AnyMySqlColumn | SQL | SQL.Aliased | TModel[K] }
 >;
 
 export class MySqlInsertBuilder<
@@ -104,7 +111,7 @@ export class MySqlInsertBuilder<
 
 		if (
 			!is(select, SQL)
-			&& !haveSameKeys(this.table[Columns], select._.selectedFields)
+			&& !haveSameKeys(this.table[TableColumns], select._.selectedFields)
 		) {
 			throw new Error(
 				'Insert select error: selected fields are not the same or are in a different order compared to the table definition',
@@ -293,14 +300,21 @@ export class MySqlInsertBase<
 		return this as any;
 	}
 
+	/**
+	 * Attach [sqlcommenter](https://google.github.io/sqlcommenter) comment to a query
+	 */
+	comment(comment: SqlCommenterInput): MySqlInsertWithout<this, TDynamic, 'comment'> {
+		this.config.comment = sql.comment(comment);
+		return this as any;
+	}
+
 	/** @internal */
 	getSQL(): SQL {
 		return this.dialect.buildInsertQuery(this.config).sql;
 	}
 
 	toSQL(): Query {
-		const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-		return rest;
+		return this.dialect.sqlToQuery(this.getSQL());
 	}
 
 	prepare(): MySqlInsertPrepare<this, TReturning> {

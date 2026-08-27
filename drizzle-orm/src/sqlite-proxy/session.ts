@@ -1,10 +1,16 @@
+import type * as V1 from '~/_relations.ts';
 import type { BatchItem } from '~/batch.ts';
 import { type Cache, NoopCache } from '~/cache/core/index.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { entityKind } from '~/entity.ts';
 import type { Logger } from '~/logger.ts';
 import { NoopLogger } from '~/logger.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import {
+	type AnyRelations,
+	makeJitRqbMapper,
+	type RelationalQueryMapperConfig,
+	type RelationalRowsMapper,
+} from '~/relations.ts';
 import type { PreparedQuery } from '~/session.ts';
 import { fillPlaceholders, type Query, sql } from '~/sql/sql.ts';
 import type { SQLiteAsyncDialect } from '~/sqlite-core/dialect.ts';
@@ -16,20 +22,22 @@ import type {
 	SQLiteTransactionConfig,
 } from '~/sqlite-core/session.ts';
 import { SQLitePreparedQuery, SQLiteSession } from '~/sqlite-core/session.ts';
-import { mapResultRow } from '~/utils.ts';
+import { makeJitQueryMapper, mapResultRow, type RowsMapper } from '~/utils.ts';
 import type { AsyncBatchRemoteCallback, AsyncRemoteCallback, RemoteCallback, SqliteRemoteResult } from './driver.ts';
 
 export interface SQLiteRemoteSessionOptions {
 	logger?: Logger;
 	cache?: Cache;
+	useJitMappers?: boolean;
 }
 
 export type PreparedQueryConfig = Omit<PreparedQueryConfigBase, 'statement' | 'run'>;
 
 export class SQLiteRemoteSession<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteSession<'async', SqliteRemoteResult, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteSession<'async', SqliteRemoteResult, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'SQLiteRemoteSession';
 
 	private logger: Logger;
@@ -38,9 +46,10 @@ export class SQLiteRemoteSession<
 	constructor(
 		private client: RemoteCallback,
 		dialect: SQLiteAsyncDialect,
-		private schema: RelationalSchemaConfig<TSchema> | undefined,
+		private relations: TRelations,
+		private schema: V1.RelationalSchemaConfig<TSchema> | undefined,
 		private batchCLient?: AsyncBatchRemoteCallback,
-		options: SQLiteRemoteSessionOptions = {},
+		private options: SQLiteRemoteSessionOptions = {},
 	) {
 		super(dialect);
 		this.logger = options.logger ?? new NoopLogger();
@@ -51,7 +60,6 @@ export class SQLiteRemoteSession<
 		query: Query,
 		fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		isResponseInArrayMode: boolean,
 		customResultMapper?: (rows: unknown[][]) => unknown,
 		queryMetadata?: {
 			type: 'select' | 'update' | 'delete' | 'insert';
@@ -68,8 +76,31 @@ export class SQLiteRemoteSession<
 			cacheConfig,
 			fields,
 			executeMethod,
-			isResponseInArrayMode,
+			this.options.useJitMappers,
 			customResultMapper,
+		);
+	}
+
+	prepareRelationalQuery<T extends Omit<PreparedQueryConfig, 'run'>>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		executeMethod: SQLiteExecuteMethod,
+		customResultMapper: (rows: Record<string, unknown>[]) => unknown,
+		config: RelationalQueryMapperConfig,
+	): RemotePreparedQuery<T, true> {
+		return new RemotePreparedQuery(
+			this.client,
+			query,
+			this.logger,
+			this.cache,
+			undefined,
+			undefined,
+			fields,
+			executeMethod,
+			this.options.useJitMappers,
+			customResultMapper,
+			true,
+			config,
 		);
 	}
 
@@ -89,10 +120,10 @@ export class SQLiteRemoteSession<
 	}
 
 	override async transaction<T>(
-		transaction: (tx: SQLiteProxyTransaction<TFullSchema, TSchema>) => Promise<T>,
+		transaction: (tx: SQLiteProxyTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 		config?: SQLiteTransactionConfig,
 	): Promise<T> {
-		const tx = new SQLiteProxyTransaction('async', this.dialect, this, this.schema);
+		const tx = new SQLiteProxyTransaction('async', this.dialect, this, this.relations, this.schema, undefined, true);
 		await this.run(sql.raw(`begin${config?.behavior ? ' ' + config.behavior : ''}`));
 		try {
 			const result = await transaction(tx);
@@ -119,15 +150,24 @@ export class SQLiteRemoteSession<
 
 export class SQLiteProxyTransaction<
 	TFullSchema extends Record<string, unknown>,
-	TSchema extends TablesRelationalConfig,
-> extends SQLiteTransaction<'async', SqliteRemoteResult, TFullSchema, TSchema> {
+	TRelations extends AnyRelations,
+	TSchema extends V1.TablesRelationalConfig,
+> extends SQLiteTransaction<'async', SqliteRemoteResult, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'SQLiteProxyTransaction';
 
 	override async transaction<T>(
-		transaction: (tx: SQLiteProxyTransaction<TFullSchema, TSchema>) => Promise<T>,
+		transaction: (tx: SQLiteProxyTransaction<TFullSchema, TRelations, TSchema>) => Promise<T>,
 	): Promise<T> {
 		const savepointName = `sp${this.nestedIndex}`;
-		const tx = new SQLiteProxyTransaction('async', this.dialect, this.session, this.schema, this.nestedIndex + 1);
+		const tx = new SQLiteProxyTransaction(
+			'async',
+			this.dialect,
+			this.session,
+			this.relations,
+			this.schema,
+			this.nestedIndex + 1,
+			true,
+		);
 		await this.session.run(sql.raw(`savepoint ${savepointName}`));
 		try {
 			const result = await transaction(tx);
@@ -140,12 +180,15 @@ export class SQLiteProxyTransaction<
 	}
 }
 
-export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig> extends SQLitePreparedQuery<
-	{ type: 'async'; run: SqliteRemoteResult; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
-> {
+export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryConfig, TIsRqbV2 extends boolean = false>
+	extends SQLitePreparedQuery<
+		{ type: 'async'; run: SqliteRemoteResult; all: T['all']; get: T['get']; values: T['values']; execute: T['execute'] }
+	>
+{
 	static override readonly [entityKind]: string = 'SQLiteProxyPreparedQuery';
 
 	private method: SQLiteExecuteMethod;
+	private jitMapper?: RowsMapper<any> | RelationalRowsMapper<any>;
 
 	constructor(
 		private client: RemoteCallback,
@@ -159,14 +202,14 @@ export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 		cacheConfig: WithCacheConfig | undefined,
 		private fields: SelectedFieldsOrdered | undefined,
 		executeMethod: SQLiteExecuteMethod,
-		private _isResponseInArrayMode: boolean,
+		private useJitMappers: boolean | undefined,
 		/** @internal */ public customResultMapper?: (
-			rows: unknown[][],
-			mapColumnValue?: (value: unknown) => unknown,
+			rows: TIsRqbV2 extends true ? Record<string, unknown>[] : unknown[][],
 		) => unknown,
+		private isRqbV2Query?: TIsRqbV2,
+		private rqbConfig?: RelationalQueryMapperConfig,
 	) {
 		super('async', executeMethod, query, cache, queryMetadata, cacheConfig);
-		this.customResultMapper = customResultMapper;
 		this.method = executeMethod;
 	}
 
@@ -191,20 +234,33 @@ export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 			return rows;
 		}
 
-		if (this.customResultMapper) {
-			return this.customResultMapper(rows as unknown[][]) as T['all'];
+		if (this.isRqbV2Query) {
+			for (let i = 0; i < (rows as unknown[]).length; ++i) {
+				(rows as unknown[])[i] = JSON.parse((rows as unknown[])[i] as string);
+			}
+
+			return this.useJitMappers
+				? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['get'][]>
+					?? makeJitRqbMapper<T['get'][]>(this.rqbConfig!))(rows as Record<string, unknown>[])
+				: (this.customResultMapper as (
+					rows: Record<string, unknown>[],
+					mapColumnValue?: (value: unknown) => unknown,
+				) => unknown)(rows as Record<string, unknown>[]);
 		}
 
-		return (rows as unknown[][]).map((row) => {
-			return mapResultRow(
-				this.fields!,
-				row,
-				this.joinsNotNullableMap,
-			);
-		});
+		if (this.customResultMapper) {
+			return (this.customResultMapper as (rows: unknown[][]) => unknown)(rows as unknown[][]) as T['all'];
+		}
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['execute']>
+				?? makeJitQueryMapper(this.fields!, this.joinsNotNullableMap))(rows as unknown[][])
+			: (rows as unknown[][]).map((row) => mapResultRow(this.fields!, row, this.joinsNotNullableMap));
 	}
 
 	async all(placeholderValues?: Record<string, unknown>): Promise<T['all']> {
+		if (this.isRqbV2Query) return this.allRqbV2(placeholderValues);
+
 		const { query, logger, client } = this;
 
 		const params = fillPlaceholders(query.params, placeholderValues ?? {});
@@ -217,6 +273,8 @@ export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 	}
 
 	async get(placeholderValues?: Record<string, unknown>): Promise<T['get']> {
+		if (this.isRqbV2Query) return this.getRqbV2(placeholderValues);
+
 		const { query, logger, client } = this;
 
 		const params = fillPlaceholders(query.params, placeholderValues ?? {});
@@ -229,12 +287,33 @@ export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 		return this.mapGetResult(clientResult.rows);
 	}
 
+	private async allRqbV2(placeholderValues?: Record<string, unknown>): Promise<T['all']> {
+		const { query, logger, client } = this;
+
+		const params = fillPlaceholders(query.params, placeholderValues ?? {});
+		logger.logQuery(query.sql, params);
+
+		const { rows } = await (client as AsyncRemoteCallback)(query.sql, params, 'all');
+		return this.mapAllResult(rows);
+	}
+
+	private async getRqbV2(placeholderValues?: Record<string, unknown>): Promise<T['get']> {
+		const { query, logger, client } = this;
+
+		const params = fillPlaceholders(query.params, placeholderValues ?? {});
+		logger.logQuery(query.sql, params);
+
+		const { rows } = await (client as AsyncRemoteCallback)(query.sql, params, 'get');
+
+		return this.mapGetResult(rows);
+	}
+
 	override mapGetResult(rows: unknown, isFromBatch?: boolean): unknown {
 		if (isFromBatch) {
 			rows = (rows as SqliteRemoteResult).rows;
 		}
 
-		const row = rows as unknown[];
+		const row = rows as unknown[] | string;
 
 		if (!this.fields && !this.customResultMapper) {
 			return row;
@@ -244,15 +323,28 @@ export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 			return undefined;
 		}
 
-		if (this.customResultMapper) {
-			return this.customResultMapper([rows] as unknown[][]) as T['get'];
+		if (this.isRqbV2Query) {
+			return this.useJitMappers
+				? (this.jitMapper = this.jitMapper as RelationalRowsMapper<T['get'][]>
+					?? makeJitRqbMapper<T['get'][]>(this.rqbConfig!))([JSON.parse(row as string) as Record<string, unknown>])
+				: (this.customResultMapper as (
+					rows: Record<string, unknown>[],
+					mapColumnValue?: (value: unknown) => unknown,
+				) => unknown)([JSON.parse(row as string) as Record<string, unknown>]);
 		}
 
-		return mapResultRow(
-			this.fields!,
-			row,
-			this.joinsNotNullableMap,
-		);
+		if (this.customResultMapper) {
+			return (this.customResultMapper as (rows: unknown[][]) => unknown)(
+				[rows] as unknown[][],
+			) as T['get'];
+		}
+
+		return this.useJitMappers
+			? (this.jitMapper = this.jitMapper as RowsMapper<T['get'][]>
+				?? makeJitQueryMapper<T['get'][]>(this.fields!, this.joinsNotNullableMap))(
+					[row as unknown[]],
+				)[0]
+			: mapResultRow(this.fields!, row as unknown[], this.joinsNotNullableMap);
 	}
 
 	async values<T extends any[] = unknown[]>(placeholderValues?: Record<string, unknown>): Promise<T[]> {
@@ -262,10 +354,5 @@ export class RemotePreparedQuery<T extends PreparedQueryConfig = PreparedQueryCo
 			return await (this.client as AsyncRemoteCallback)(this.query.sql, params, 'values');
 		});
 		return clientResult.rows as T[];
-	}
-
-	/** @internal */
-	isResponseInArrayMode(): boolean {
-		return this._isResponseInArrayMode;
 	}
 }

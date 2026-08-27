@@ -37,7 +37,7 @@ export interface SQLiteSelectJoinConfig {
 
 export type BuildAliasTable<TTable extends SQLiteTable | View, TAlias extends string> = TTable extends Table
 	? SQLiteTableWithColumns<
-		UpdateTableConfig<TTable['_']['config'], {
+		UpdateTableConfig<TTable['_'], {
 			name: TAlias;
 			columns: MapColumnsToTableAlias<TTable['_']['columns'], TAlias, 'sqlite'>;
 		}>
@@ -107,17 +107,21 @@ export type SQLiteSelectJoinFn<
 	T extends AnySQLiteSelectQueryBuilder,
 	TDynamic extends boolean,
 	TJoinType extends JoinType,
-> = 'cross' extends TJoinType ? <
-		TJoinedTable extends SQLiteTable | Subquery | SQLiteViewBase | SQL,
-		TJoinedName extends GetSelectTableName<TJoinedTable> = GetSelectTableName<TJoinedTable>,
-	>(table: TJoinedTable) => SQLiteSelectJoin<T, TDynamic, TJoinType, TJoinedTable, TJoinedName>
-	: <
-		TJoinedTable extends SQLiteTable | Subquery | SQLiteViewBase | SQL,
-		TJoinedName extends GetSelectTableName<TJoinedTable> = GetSelectTableName<TJoinedTable>,
-	>(
-		table: TJoinedTable,
-		on: ((aliases: T['_']['selection']) => SQL | undefined) | SQL | undefined,
-	) => SQLiteSelectJoin<T, TDynamic, TJoinType, TJoinedTable, TJoinedName>;
+> = <
+	TJoinedTable extends SQLiteTable | Subquery | SQLiteViewBase | SQL,
+	TJoinedName extends GetSelectTableName<TJoinedTable> = GetSelectTableName<TJoinedTable>,
+>(
+	table: TJoinedTable,
+	on: ((aliases: T['_']['selection']) => SQL | undefined) | SQL | undefined,
+) => SQLiteSelectJoin<T, TDynamic, TJoinType, TJoinedTable, TJoinedName>;
+
+export type SQLiteSelectCrossJoinFn<
+	T extends AnySQLiteSelectQueryBuilder,
+	TDynamic extends boolean,
+> = <
+	TJoinedTable extends SQLiteTable | Subquery | SQLiteViewBase | SQL,
+	TJoinedName extends GetSelectTableName<TJoinedTable> = GetSelectTableName<TJoinedTable>,
+>(table: TJoinedTable) => SQLiteSelectJoin<T, TDynamic, 'cross', TJoinedTable, TJoinedName>;
 
 export type SelectedFieldsFlat = SelectFieldsFlatBase<SQLiteColumn>;
 

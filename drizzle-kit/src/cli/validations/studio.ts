@@ -1,5 +1,6 @@
-import { coerce, intersection, object, string, TypeOf, union } from 'zod';
-import { dialect } from '../../schemaValidator';
+import type { TypeOf } from 'zod';
+import { coerce, intersection, object, string, union } from 'zod';
+import { dialect } from '../../utils/schemaValidator';
 import { mysqlCredentials } from './mysql';
 import { postgresCredentials } from './postgres';
 import { sqliteCredentials } from './sqlite';

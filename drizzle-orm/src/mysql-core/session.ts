@@ -1,9 +1,9 @@
+import type * as V1 from '~/_relations.ts';
 import { type Cache, hashQuery, NoopCache } from '~/cache/core/cache.ts';
 import type { WithCacheConfig } from '~/cache/core/types.ts';
 import { entityKind, is } from '~/entity.ts';
-import { TransactionRollbackError } from '~/errors.ts';
-import { DrizzleQueryError } from '~/errors/index.ts';
-import type { RelationalSchemaConfig, TablesRelationalConfig } from '~/relations.ts';
+import { DrizzleQueryError, TransactionRollbackError } from '~/errors.ts';
+import type { AnyRelations, EmptyRelations, RelationalQueryMapperConfig } from '~/relations.ts';
 import { type Query, type SQL, sql } from '~/sql/sql.ts';
 import type { Assume, Equal } from '~/utils.ts';
 import { MySqlDatabase } from './db.ts';
@@ -48,7 +48,8 @@ export type PreparedQueryKind<
 export abstract class MySqlPreparedQuery<T extends MySqlPreparedQueryConfig> {
 	static readonly [entityKind]: string = 'MySqlPreparedQuery';
 
-	constructor( // cache instance
+	constructor(
+		// cache instance
 		private cache: Cache | undefined,
 		// per query related metadata
 		private queryMetadata: {
@@ -60,9 +61,9 @@ export abstract class MySqlPreparedQuery<T extends MySqlPreparedQueryConfig> {
 	) {
 		// it means that no $withCache options were passed and it should be just enabled
 		if (cache && cache.strategy() === 'all' && cacheConfig === undefined) {
-			this.cacheConfig = { enable: true, autoInvalidate: true };
+			this.cacheConfig = { enabled: true, autoInvalidate: true };
 		}
-		if (!this.cacheConfig?.enable) {
+		if (!this.cacheConfig?.enabled) {
 			this.cacheConfig = undefined;
 		}
 	}
@@ -82,7 +83,7 @@ export abstract class MySqlPreparedQuery<T extends MySqlPreparedQueryConfig> {
 		}
 
 		// don't do any mutations, if globally is false
-		if (this.cacheConfig && !this.cacheConfig.enable) {
+		if (this.cacheConfig && !this.cacheConfig.enabled) {
 			try {
 				return await query();
 			} catch (e) {
@@ -172,7 +173,8 @@ export abstract class MySqlSession<
 	TQueryResult extends MySqlQueryResultHKT = MySqlQueryResultHKT,
 	TPreparedQueryHKT extends PreparedQueryHKTBase = PreparedQueryHKTBase,
 	TFullSchema extends Record<string, unknown> = Record<string, never>,
-	TSchema extends TablesRelationalConfig = Record<string, never>,
+	TRelations extends AnyRelations = EmptyRelations,
+	TSchema extends V1.TablesRelationalConfig = V1.ExtractTablesWithRelations<TFullSchema>,
 > {
 	static readonly [entityKind]: string = 'MySqlSession';
 
@@ -189,6 +191,15 @@ export abstract class MySqlSession<
 			tables: string[];
 		},
 		cacheConfig?: WithCacheConfig,
+	): PreparedQueryKind<TPreparedQueryHKT, T>;
+
+	abstract prepareRelationalQuery<T extends MySqlPreparedQueryConfig, TPreparedQueryHKT extends MySqlPreparedQueryHKT>(
+		query: Query,
+		fields: SelectedFieldsOrdered | undefined,
+		customResultMapper: (rows: Record<string, unknown>[]) => T['execute'],
+		config: RelationalQueryMapperConfig,
+		generatedIds?: Record<string, unknown>[],
+		returningIds?: SelectedFieldsOrdered,
 	): PreparedQueryKind<TPreparedQueryHKT, T>;
 
 	execute<T>(query: SQL): Promise<T> {
@@ -209,7 +220,9 @@ export abstract class MySqlSession<
 	}
 
 	abstract transaction<T>(
-		transaction: (tx: MySqlTransaction<TQueryResult, TPreparedQueryHKT, TFullSchema, TSchema>) => Promise<T>,
+		transaction: (
+			tx: MySqlTransaction<TQueryResult, TPreparedQueryHKT, TFullSchema, TRelations, TSchema>,
+		) => Promise<T>,
 		config?: MySqlTransactionConfig,
 	): Promise<T>;
 
@@ -242,18 +255,20 @@ export abstract class MySqlTransaction<
 	TQueryResult extends MySqlQueryResultHKT,
 	TPreparedQueryHKT extends PreparedQueryHKTBase,
 	TFullSchema extends Record<string, unknown> = Record<string, never>,
-	TSchema extends TablesRelationalConfig = Record<string, never>,
-> extends MySqlDatabase<TQueryResult, TPreparedQueryHKT, TFullSchema, TSchema> {
+	TRelations extends AnyRelations = EmptyRelations,
+	TSchema extends V1.TablesRelationalConfig = V1.ExtractTablesWithRelations<TFullSchema>,
+> extends MySqlDatabase<TQueryResult, TPreparedQueryHKT, TFullSchema, TRelations, TSchema> {
 	static override readonly [entityKind]: string = 'MySqlTransaction';
 
 	constructor(
 		dialect: MySqlDialect,
 		session: MySqlSession,
-		protected schema: RelationalSchemaConfig<TSchema> | undefined,
+		protected relations: TRelations,
+		protected schema: V1.RelationalSchemaConfig<TSchema> | undefined,
 		protected readonly nestedIndex: number,
 		mode: Mode,
 	) {
-		super(dialect, session, schema, mode);
+		super(dialect, session, relations, schema, mode);
 	}
 
 	rollback(): never {
@@ -262,7 +277,9 @@ export abstract class MySqlTransaction<
 
 	/** Nested transactions (aka savepoints) only work with InnoDB engine. */
 	abstract override transaction<T>(
-		transaction: (tx: MySqlTransaction<TQueryResult, TPreparedQueryHKT, TFullSchema, TSchema>) => Promise<T>,
+		transaction: (
+			tx: MySqlTransaction<TQueryResult, TPreparedQueryHKT, TFullSchema, TRelations, TSchema>,
+		) => Promise<T>,
 	): Promise<T>;
 }
 

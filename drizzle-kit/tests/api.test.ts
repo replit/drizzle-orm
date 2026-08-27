@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from 'vitest';
-import { preparePgDB } from '../src/api';
+import type { JsonStatement } from '../src/dialects/postgres/statements';
+import { pgSchema, pgSuggestions, preparePgDB, squashPgScheme } from '../src/ext/api';
 
 vi.mock('pg', () => ({
 	default: {
@@ -21,6 +22,10 @@ vi.mock('drizzle-orm/node-postgres', () => ({
 
 vi.mock('drizzle-orm/node-postgres/migrator', () => ({
 	migrate: vi.fn(),
+}));
+
+vi.mock('../src/cli/commands/push-postgres', () => ({
+	suggestions: vi.fn(async () => []),
 }));
 
 function createObservedPool() {
@@ -70,8 +75,8 @@ describe('preparePgDB', () => {
 			db.query('select 1'),
 			db.query('select 2'),
 			db.query('select 3'),
-			db.proxy({ mode: 'array', params: [], sql: 'select 4' }),
-			db.proxy({ mode: 'object', params: [], sql: 'select 5' }),
+			db.proxy({ method: 'all', mode: 'array', params: [], sql: 'select 4' }),
+			db.proxy({ method: 'all', mode: 'object', params: [], sql: 'select 5' }),
 		]);
 
 		expect(observed.query).toHaveBeenCalledTimes(5);
@@ -90,5 +95,38 @@ describe('preparePgDB', () => {
 		await expect(
 			preparePgDB(observed.pool as any, { queryConcurrency: 1.5 }),
 		).rejects.toThrow('queryConcurrency must be a positive integer');
+	});
+});
+
+describe('Replit compatibility API', () => {
+	test('keeps the legacy empty target schema accepted by pid2', () => {
+		const schema = pgSchema.parse({
+			version: '7',
+			dialect: 'postgresql',
+			id: '00000000-0000-0000-0000-000000000000',
+			prevId: '',
+			tables: {},
+			enums: {},
+			schemas: {},
+			policies: {},
+			roles: {},
+			sequences: {},
+			views: {},
+			_meta: {},
+		});
+
+		const ddl = squashPgScheme(schema, 'push');
+
+		expect(ddl.entities.list()).toHaveLength(0);
+	});
+
+	test('returns executable SQL from v1 json statements', async () => {
+		const db = { query: vi.fn() };
+		const statements: JsonStatement[] = [{ type: 'create_schema', name: 'private' }];
+
+		const result = await pgSuggestions(db, statements);
+
+		expect(result.statementsToExecute).toEqual(['CREATE SCHEMA "private";\n']);
+		expect(result.shouldAskForApprove).toBe(false);
 	});
 });

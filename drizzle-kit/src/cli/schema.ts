@@ -3,21 +3,21 @@ import chalk from 'chalk';
 import 'dotenv/config';
 import { mkdirSync } from 'fs';
 import { renderWithTask } from 'hanji';
-import { dialects } from 'src/schemaValidator';
+import { dialects } from 'src/utils/schemaValidator';
 import '../@types/utils';
-import { assertUnreachable } from '../global';
-import { type Setup } from '../serializer/studio';
-import { assertV1OutFolder } from '../utils';
-import { certs } from '../utils/certs';
+import type { MigrationConfig, MigratorInitFailResponse } from 'drizzle-orm/migrator';
+import { assertUnreachable } from '../utils';
+import { assertV3OutFolder } from '../utils/utils-node';
 import { checkHandler } from './commands/check';
-import { dropMigration } from './commands/drop';
-import { upMysqlHandler } from './commands/mysqlUp';
-import { upPgHandler } from './commands/pgUp';
-import { upSinglestoreHandler } from './commands/singlestoreUp';
-import { upSqliteHandler } from './commands/sqliteUp';
+import type { Setup } from './commands/studio';
+import { upCockroachHandler } from './commands/up-cockroach';
+import { upMssqlHandler } from './commands/up-mssql';
+import { upMysqlHandler } from './commands/up-mysql';
+import { upPgHandler } from './commands/up-postgres';
+import { upSinglestoreHandler } from './commands/up-singlestore';
+import { upSqliteHandler } from './commands/up-sqlite';
 import {
 	prepareCheckParams,
-	prepareDropParams,
 	prepareExportConfig,
 	prepareGenerateConfig,
 	prepareMigrateConfig,
@@ -26,14 +26,16 @@ import {
 	prepareStudioConfig,
 } from './commands/utils';
 import { assertOrmCoreVersion, assertPackages, assertStudioNodeVersion, ormVersionGt } from './utils';
-import { assertCollisions, drivers, prefixes } from './validations/common';
+import { assertCollisions, drivers } from './validations/common';
+import type { LibSQLCredentials } from './validations/libsql';
 import { withStyle } from './validations/outputs';
+import type { SqliteCredentials } from './validations/sqlite';
 import { error, grey, MigrateProgress } from './views';
 
 const optionDialect = string('dialect')
 	.enum(...dialects)
 	.desc(
-		`Database dialect: 'gel', 'postgresql', 'mysql', 'sqlite', 'turso' or 'singlestore'`,
+		`Database dialect: 'postgresql', 'mysql', 'sqlite', 'turso', 'singlestore', 'duckdb' or 'mssql'`,
 	);
 const optionOut = string().desc("Output folder, 'drizzle' by default");
 const optionConfig = string().desc('Path to drizzle config file');
@@ -45,7 +47,9 @@ const optionDriver = string()
 	.enum(...drivers)
 	.desc('Database driver');
 
-const optionCasing = string().enum('camelCase', 'snake_case').desc('Casing for serialization');
+const optionIgnoreConflicts = boolean('ignore-conflicts').desc(
+	'Skip commutativity conflict checks',
+);
 
 export const generate = command({
 	name: 'generate',
@@ -53,7 +57,6 @@ export const generate = command({
 		config: optionConfig,
 		dialect: optionDialect,
 		driver: optionDriver,
-		casing: optionCasing,
 		schema: string().desc('Path to a schema file or folder'),
 		out: optionOut,
 		name: string().desc('Migration file name'),
@@ -61,16 +64,14 @@ export const generate = command({
 		custom: boolean()
 			.desc('Prepare empty migration file for custom SQL')
 			.default(false),
-		prefix: string()
-			.enum(...prefixes)
-			.default('index'),
+		ignoreConflicts: optionIgnoreConflicts,
 	},
 	transform: async (opts) => {
 		const from = assertCollisions(
 			'generate',
 			opts,
-			['prefix', 'name', 'custom'],
-			['driver', 'breakpoints', 'schema', 'out', 'dialect', 'casing'],
+			['name', 'custom', 'ignoreConflicts'],
+			['driver', 'breakpoints', 'schema', 'out', 'dialect'],
 		);
 		return prepareGenerateConfig(opts, from);
 	},
@@ -78,32 +79,39 @@ export const generate = command({
 		await assertOrmCoreVersion();
 		await assertPackages('drizzle-orm');
 
-		// const parsed = cliConfigGenerate.parse(opts);
-
-		const {
-			prepareAndMigratePg,
-			prepareAndMigrateMysql,
-			prepareAndMigrateSqlite,
-			prepareAndMigrateLibSQL,
-			prepareAndMigrateSingleStore,
-		} = await import('./commands/migrate');
+		assertV3OutFolder(opts.out);
 
 		const dialect = opts.dialect;
+		const checkResult = await checkHandler(
+			opts.out,
+			dialect,
+			opts.ignoreConflicts,
+		);
+
 		if (dialect === 'postgresql') {
-			await prepareAndMigratePg(opts);
+			const { handle } = await import('./commands/generate-postgres');
+			await handle(opts, checkResult);
 		} else if (dialect === 'mysql') {
-			await prepareAndMigrateMysql(opts);
+			const { handle } = await import('./commands/generate-mysql');
+			await handle(opts, checkResult);
 		} else if (dialect === 'sqlite') {
-			await prepareAndMigrateSqlite(opts);
+			const { handle } = await import('./commands/generate-sqlite');
+			await handle(opts, checkResult);
 		} else if (dialect === 'turso') {
-			await prepareAndMigrateLibSQL(opts);
+			const { handle } = await import('./commands/generate-libsql');
+			await handle(opts, checkResult);
 		} else if (dialect === 'singlestore') {
-			await prepareAndMigrateSingleStore(opts);
-		} else if (dialect === 'gel') {
+			const { handle } = await import('./commands/generate-singlestore');
+			await handle(opts);
+		} else if (dialect === 'mssql') {
+			const { handle } = await import('./commands/generate-mssql');
+			await handle(opts);
+		} else if (dialect === 'cockroach') {
+			const { handle } = await import('./commands/generate-cockroach');
+			await handle(opts);
+		} else if (dialect === 'duckdb') {
 			console.log(
-				error(
-					`You can't use 'generate' command with Gel dialect`,
-				),
+				error(`You can't use 'generate' command with DuckDb dialect`),
 			);
 			process.exit(1);
 		} else {
@@ -116,107 +124,127 @@ export const migrate = command({
 	name: 'migrate',
 	options: {
 		config: optionConfig,
+		ignoreConflicts: optionIgnoreConflicts,
 	},
 	transform: async (opts) => {
-		return await prepareMigrateConfig(opts.config);
+		const migrateConf = await prepareMigrateConfig(opts.config);
+		return {
+			...migrateConf,
+			...(opts.ignoreConflicts !== undefined && {
+				ignoreConflicts: opts.ignoreConflicts,
+			}),
+		};
 	},
 	handler: async (opts) => {
 		await assertOrmCoreVersion();
 		await assertPackages('drizzle-orm');
 
-		const { dialect, schema, table, out, credentials } = opts;
-		try {
-			if (dialect === 'postgresql') {
-				if ('driver' in credentials) {
-					const { driver } = credentials;
-					if (driver === 'aws-data-api') {
-						if (!(await ormVersionGt('0.30.10'))) {
-							console.log(
-								"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else if (driver === 'pglite') {
-						if (!(await ormVersionGt('0.30.6'))) {
-							console.log(
-								"To use 'pglite' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else {
-						assertUnreachable(driver);
-					}
-				}
-				const { preparePostgresDB } = await import('./connections');
-				const { migrate } = await preparePostgresDB(credentials);
-				await renderWithTask(
-					new MigrateProgress(),
-					migrate({
-						migrationsFolder: out,
-						migrationsTable: table,
-						migrationsSchema: schema,
-					}),
-				);
-			} else if (dialect === 'mysql') {
-				const { connectToMySQL } = await import('./connections');
-				const { migrate } = await connectToMySQL(credentials);
-				await renderWithTask(
-					new MigrateProgress(),
-					migrate({
-						migrationsFolder: out,
-						migrationsTable: table,
-						migrationsSchema: schema,
-					}),
-				);
-			} else if (dialect === 'singlestore') {
-				const { connectToSingleStore } = await import('./connections');
-				const { migrate } = await connectToSingleStore(credentials);
-				await renderWithTask(
-					new MigrateProgress(),
-					migrate({
-						migrationsFolder: out,
-						migrationsTable: table,
-						migrationsSchema: schema,
-					}),
-				);
-			} else if (dialect === 'sqlite') {
-				const { connectToSQLite } = await import('./connections');
-				const { migrate } = await connectToSQLite(credentials);
-				await renderWithTask(
-					new MigrateProgress(),
-					migrate({
-						migrationsFolder: opts.out,
-						migrationsTable: table,
-						migrationsSchema: schema,
-					}),
-				);
-			} else if (dialect === 'turso') {
-				const { connectToLibSQL } = await import('./connections');
-				const { migrate } = await connectToLibSQL(credentials);
-				await renderWithTask(
-					new MigrateProgress(),
-					migrate({
-						migrationsFolder: opts.out,
-						migrationsTable: table,
-						migrationsSchema: schema,
-					}),
-				);
-			} else if (dialect === 'gel') {
-				console.log(
-					error(
-						`You can't use 'migrate' command with Gel dialect`,
-					),
-				);
-				process.exit(1);
-			} else {
-				assertUnreachable(dialect);
-			}
-		} catch (e) {
-			console.error(e);
-			process.exit(1);
-		}
+		assertV3OutFolder(opts.out);
 
-		process.exit(0);
+		const { dialect, schema, table, out, credentials, ignoreConflicts } = opts;
+
+		await checkHandler(out, dialect, ignoreConflicts);
+
+		if (dialect === 'postgresql') {
+			if ('driver' in credentials) {
+				const { driver } = credentials;
+				if (driver === 'aws-data-api') {
+					if (!(await ormVersionGt('0.30.10'))) {
+						console.log(
+							"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
+						);
+						process.exit(1);
+					}
+				} else if (driver === 'pglite') {
+					if (!(await ormVersionGt('0.30.6'))) {
+						console.log(
+							"To use 'pglite' driver - please update drizzle-orm to the latest version",
+						);
+						process.exit(1);
+					}
+				} else {
+					assertUnreachable(driver);
+				}
+			}
+			const { preparePostgresDB } = await import('./connections');
+			const { migrate } = await preparePostgresDB(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else if (dialect === 'mysql') {
+			const { connectToMySQL } = await import('./connections');
+			const { migrate } = await connectToMySQL(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else if (dialect === 'singlestore') {
+			const { connectToSingleStore } = await import('./connections');
+			const { migrate } = await connectToSingleStore(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else if (dialect === 'sqlite') {
+			const { connectToSQLite } = await import('./connections');
+			const { migrate } = await connectToSQLite(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: opts.out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else if (dialect === 'turso') {
+			const { connectToLibSQL } = await import('./connections');
+			const { migrate } = await connectToLibSQL(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: opts.out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else if (dialect === 'cockroach') {
+			const { prepareCockroach } = await import('./connections');
+			const { migrate } = await prepareCockroach(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else if (dialect === 'mssql') {
+			const { connectToMsSQL } = await import('./connections');
+			const { migrate } = await connectToMsSQL(credentials);
+			await renderWithTask(
+				new MigrateProgress(),
+				migrate({
+					migrationsFolder: out,
+					migrationsTable: table,
+					migrationsSchema: schema,
+				}),
+			);
+		} else {
+			assertUnreachable(dialect);
+		}
 	},
 });
 
@@ -249,25 +277,27 @@ export const push = command({
 	options: {
 		config: optionConfig,
 		dialect: optionDialect,
-		casing: optionCasing,
 		schema: string().desc('Path to a schema file or folder'),
 		...optionsFilters,
 		...optionsDatabaseCredentials,
 		verbose: boolean()
 			.desc('Print all statements for each push')
 			.default(false),
-		strict: boolean().desc('Always ask for confirmation').default(false),
+		strict: boolean().desc('Always ask for confirmation'),
 		force: boolean()
 			.desc(
 				'Auto-approve all data loss statements. Note: Data loss statements may truncate your tables and data',
 			)
+			.default(false),
+		explain: boolean()
+			.desc('Print the planned SQL changes (dry run)')
 			.default(false),
 	},
 	transform: async (opts) => {
 		const from = assertCollisions(
 			'push',
 			opts,
-			['force', 'verbose', 'strict'],
+			['force', 'verbose', 'strict', 'explain'],
 			[
 				'schema',
 				'dialect',
@@ -283,10 +313,18 @@ export const push = command({
 				'schemaFilters',
 				'extensionsFilters',
 				'tablesFilter',
-				'casing',
 				'tlsSecurity',
 			],
 		);
+
+		if (typeof opts.strict !== 'undefined') {
+			console.log(
+				withStyle.fullWarning(
+					"⚠️ Deprecated: Do not use 'strict' flag. Use 'explain' instead",
+				),
+			);
+			process.exit(1);
+		}
 
 		return preparePushConfig(opts, from);
 	},
@@ -296,110 +334,106 @@ export const push = command({
 
 		const {
 			dialect,
-			schemaPath,
-			strict,
 			verbose,
 			credentials,
-			tablesFilter,
-			schemasFilter,
 			force,
-			casing,
-			entities,
+			filters,
+			explain,
+			migrations,
+			filenames,
 		} = config;
 
-		try {
-			if (dialect === 'mysql') {
-				const { mysqlPush } = await import('./commands/push');
-				await mysqlPush(
-					schemaPath,
-					credentials,
-					tablesFilter,
-					strict,
-					verbose,
-					force,
-					casing,
-				);
-			} else if (dialect === 'postgresql') {
-				if ('driver' in credentials) {
-					const { driver } = credentials;
-					if (driver === 'aws-data-api') {
-						if (!(await ormVersionGt('0.30.10'))) {
-							console.log(
-								"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else if (driver === 'pglite') {
-						if (!(await ormVersionGt('0.30.6'))) {
-							console.log(
-								"To use 'pglite' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else {
-						assertUnreachable(driver);
-					}
+		if (dialect === 'mysql') {
+			const { handle } = await import('./commands/push-mysql');
+			await handle(
+				filenames,
+				credentials,
+				verbose,
+				force,
+				filters,
+				explain,
+				migrations,
+			);
+		} else if (dialect === 'postgresql') {
+			if ('driver' in credentials) {
+				const { driver } = credentials;
+				if (driver === 'aws-data-api' && !(await ormVersionGt('0.30.10'))) {
+					console.log(
+						"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
+					);
+					process.exit(1);
 				}
-
-				const { pgPush } = await import('./commands/push');
-				await pgPush(
-					schemaPath,
-					verbose,
-					strict,
-					credentials,
-					tablesFilter,
-					schemasFilter,
-					entities,
-					force,
-					casing,
-				);
-			} else if (dialect === 'sqlite') {
-				const { sqlitePush } = await import('./commands/push');
-				await sqlitePush(
-					schemaPath,
-					verbose,
-					strict,
-					credentials,
-					tablesFilter,
-					force,
-					casing,
-				);
-			} else if (dialect === 'turso') {
-				const { libSQLPush } = await import('./commands/push');
-				await libSQLPush(
-					schemaPath,
-					verbose,
-					strict,
-					credentials,
-					tablesFilter,
-					force,
-					casing,
-				);
-			} else if (dialect === 'singlestore') {
-				const { singlestorePush } = await import('./commands/push');
-				await singlestorePush(
-					schemaPath,
-					credentials,
-					tablesFilter,
-					strict,
-					verbose,
-					force,
-					casing,
-				);
-			} else if (dialect === 'gel') {
-				console.log(
-					error(
-						`You can't use 'push' command with Gel dialect`,
-					),
-				);
-				process.exit(1);
-			} else {
-				assertUnreachable(dialect);
+				if (driver === 'pglite' && !(await ormVersionGt('0.30.6'))) {
+					console.log(
+						"To use 'pglite' driver - please update drizzle-orm to the latest version",
+					);
+					process.exit(1);
+				}
 			}
-		} catch (e) {
-			console.error(e);
+
+			const { handle } = await import('./commands/push-postgres');
+			await handle(
+				filenames,
+				verbose,
+				credentials,
+				filters,
+				force,
+				explain,
+				migrations,
+			);
+		} else if (dialect === 'sqlite' || dialect === 'turso') {
+			const { connectToSQLite, connectToLibSQL } = await import('./connections');
+			const db = dialect === 'sqlite'
+				? await connectToSQLite(credentials as SqliteCredentials)
+				: await connectToLibSQL(credentials as LibSQLCredentials);
+
+			const { handle: sqlitePush } = await import('./commands/push-sqlite');
+			await sqlitePush(
+				db,
+				filenames,
+				verbose,
+				credentials,
+				filters,
+				force,
+				explain,
+				migrations,
+			);
+		} else if (dialect === 'singlestore') {
+			const { handle } = await import('./commands/push-singlestore');
+			await handle(
+				filenames,
+				credentials,
+				filters,
+				verbose,
+				force,
+				explain,
+				migrations,
+			);
+		} else if (dialect === 'cockroach') {
+			const { handle } = await import('./commands/push-cockroach');
+			await handle(
+				filenames,
+				verbose,
+				credentials,
+				filters,
+				force,
+				explain,
+				migrations,
+			);
+		} else if (dialect === 'mssql') {
+			const { handle } = await import('./commands/push-mssql');
+			await handle(
+				filenames,
+				verbose,
+				credentials,
+				filters,
+				force,
+				explain,
+				migrations,
+			);
+		} else {
+			assertUnreachable(dialect);
 		}
-		process.exit(0);
 	},
 });
 
@@ -409,16 +443,27 @@ export const check = command({
 		config: optionConfig,
 		dialect: optionDialect,
 		out: optionOut,
+		ignoreConflicts: optionIgnoreConflicts,
 	},
 	transform: async (opts) => {
-		const from = assertCollisions('check', opts, [], ['dialect', 'out']);
-		return prepareCheckParams(opts, from);
+		const from = assertCollisions(
+			'check',
+			opts,
+			['ignoreConflicts'],
+			['dialect', 'out'],
+		);
+		return {
+			...(await prepareCheckParams(opts, from)),
+			ignoreConflicts: opts.ignoreConflicts,
+		};
 	},
 	handler: async (config) => {
 		await assertOrmCoreVersion();
 
-		const { out, dialect } = config;
-		checkHandler(out, dialect);
+		assertV3OutFolder(config.out);
+
+		const { out, dialect, ignoreConflicts } = config;
+		await checkHandler(out, dialect, ignoreConflicts);
 		console.log("Everything's fine 🐶🔥");
 	},
 });
@@ -441,41 +486,49 @@ export const up = command({
 		await assertPackages('drizzle-orm');
 
 		if (dialect === 'postgresql') {
-			upPgHandler(out);
+			return upPgHandler(out);
 		}
 
 		if (dialect === 'mysql') {
-			upMysqlHandler(out);
+			return upMysqlHandler(out);
 		}
 
 		if (dialect === 'sqlite' || dialect === 'turso') {
-			upSqliteHandler(out);
+			return upSqliteHandler(out);
 		}
 
 		if (dialect === 'singlestore') {
-			upSinglestoreHandler(out);
+			return upSinglestoreHandler(out);
 		}
 
-		if (dialect === 'gel') {
-			console.log(
-				error(
-					`You can't use 'up' command with Gel dialect`,
-				),
-			);
-			process.exit(1);
+		if (dialect === 'cockroach') {
+			return upCockroachHandler(out);
 		}
+
+		if (dialect === 'mssql') {
+			return upMssqlHandler(out);
+		}
+
+		if (dialect === 'duckdb') {
+			throw new Error(`You can't use 'pull' command with '${dialect}' dialect`);
+		}
+
+		assertUnreachable(dialect);
 	},
 });
 
 export const pull = command({
-	name: 'introspect',
-	aliases: ['pull'],
+	name: 'pull',
+	aliases: ['introspect'],
 	options: {
 		config: optionConfig,
 		dialect: optionDialect,
 		out: optionOut,
 		breakpoints: optionBreakpoints,
 		casing: string('introspect-casing').enum('camel', 'preserve'),
+		init: boolean('init').desc(
+			'Create migration metadata for pulled schema in database',
+		),
 		...optionsFilters,
 		...optionsDatabaseCredentials,
 	},
@@ -483,7 +536,7 @@ export const pull = command({
 		const from = assertCollisions(
 			'introspect',
 			opts,
-			[],
+			['init'],
 			[
 				'dialect',
 				'driver',
@@ -516,136 +569,178 @@ export const pull = command({
 			out,
 			casing,
 			breakpoints,
-			tablesFilter,
-			schemasFilter,
-			prefix,
-			entities,
+			filters,
+			init,
+			migrations,
 		} = config;
 		mkdirSync(out, { recursive: true });
 
-		console.log(
-			grey(
-				`Pulling from [${
-					schemasFilter
-						.map((it) => `'${it}'`)
-						.join(', ')
-				}] list of schemas`,
-			),
-		);
-		console.log();
-
-		try {
-			if (dialect === 'postgresql') {
-				if ('driver' in credentials) {
-					const { driver } = credentials;
-					if (driver === 'aws-data-api') {
-						if (!(await ormVersionGt('0.30.10'))) {
-							console.log(
-								"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else if (driver === 'pglite') {
-						if (!(await ormVersionGt('0.30.6'))) {
-							console.log(
-								"To use 'pglite' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else {
-						assertUnreachable(driver);
+		let migrate:
+			| ((config: MigrationConfig) => Promise<void | MigratorInitFailResponse>)
+			| undefined;
+		if (dialect === 'postgresql') {
+			if ('driver' in credentials) {
+				const { driver } = credentials;
+				if (driver === 'aws-data-api') {
+					if (!(await ormVersionGt('0.30.10'))) {
+						console.log(
+							"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
+						);
+						process.exit(1);
 					}
+				} else if (driver === 'pglite') {
+					if (!(await ormVersionGt('0.30.6'))) {
+						console.log(
+							"To use 'pglite' driver - please update drizzle-orm to the latest version",
+						);
+						process.exit(1);
+					}
+				} else {
+					assertUnreachable(driver);
 				}
-
-				const { introspectPostgres } = await import('./commands/introspect');
-				await introspectPostgres(
-					casing,
-					out,
-					breakpoints,
-					credentials,
-					tablesFilter,
-					schemasFilter,
-					prefix,
-					entities,
-				);
-			} else if (dialect === 'mysql') {
-				const { introspectMysql } = await import('./commands/introspect');
-				await introspectMysql(
-					casing,
-					out,
-					breakpoints,
-					credentials,
-					tablesFilter,
-					prefix,
-				);
-			} else if (dialect === 'sqlite') {
-				const { introspectSqlite } = await import('./commands/introspect');
-				await introspectSqlite(
-					casing,
-					out,
-					breakpoints,
-					credentials,
-					tablesFilter,
-					prefix,
-				);
-			} else if (dialect === 'turso') {
-				const { introspectLibSQL } = await import('./commands/introspect');
-				await introspectLibSQL(
-					casing,
-					out,
-					breakpoints,
-					credentials,
-					tablesFilter,
-					prefix,
-				);
-			} else if (dialect === 'singlestore') {
-				const { introspectSingleStore } = await import('./commands/introspect');
-				await introspectSingleStore(
-					casing,
-					out,
-					breakpoints,
-					credentials,
-					tablesFilter,
-					prefix,
-				);
-			} else if (dialect === 'gel') {
-				const { introspectGel } = await import('./commands/introspect');
-				await introspectGel(
-					casing,
-					out,
-					breakpoints,
-					credentials,
-					tablesFilter,
-					schemasFilter,
-					prefix,
-					entities,
-				);
-			} else {
-				assertUnreachable(dialect);
 			}
-		} catch (e) {
-			console.error(e);
+
+			const { preparePostgresDB } = await import('./connections');
+			const db = await preparePostgresDB(credentials);
+			migrate = db.migrate;
+
+			const { handle: introspectPostgres } = await import(
+				'./commands/pull-postgres'
+			);
+			await introspectPostgres(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				migrations,
+				db,
+			);
+		} else if (dialect === 'mysql') {
+			const { connectToMySQL } = await import('./connections');
+			const db = await connectToMySQL(credentials);
+			migrate = db.migrate;
+
+			const { handle: introspectMysql } = await import('./commands/pull-mysql');
+			await introspectMysql(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				migrations,
+				db,
+			);
+		} else if (dialect === 'sqlite') {
+			const { connectToSQLite } = await import('./connections');
+			const db = await connectToSQLite(credentials);
+			migrate = db.migrate;
+
+			const { handle } = await import('./commands/pull-sqlite');
+			await handle(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				'sqlite',
+				migrations,
+				db,
+			);
+		} else if (dialect === 'turso') {
+			const { connectToLibSQL } = await import('./connections');
+			const db = await connectToLibSQL(credentials);
+			migrate = db.migrate;
+
+			const { handle } = await import('./commands/pull-libsql');
+			await handle(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				'libsql',
+				migrations,
+				db,
+			);
+		} else if (dialect === 'singlestore') {
+			const { connectToSingleStore } = await import('./connections');
+			const db = await connectToSingleStore(credentials);
+			migrate = db.migrate;
+
+			const { handle } = await import('./commands/pull-singlestore');
+			await handle(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				migrations,
+				db,
+			);
+		} else if (dialect === 'mssql') {
+			const { connectToMsSQL } = await import('./connections');
+			const db = await connectToMsSQL(credentials);
+			migrate = db.migrate;
+
+			const { handle } = await import('./commands/pull-mssql');
+			await handle(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				migrations,
+				db,
+			);
+		} else if (dialect === 'cockroach') {
+			const { prepareCockroach } = await import('./connections');
+			const db = await prepareCockroach(credentials);
+			migrate = db.migrate;
+
+			const { handle } = await import('./commands/pull-cockroach');
+			await handle(
+				casing,
+				out,
+				breakpoints,
+				credentials,
+				filters,
+				migrations,
+				db,
+			);
+		} else {
+			assertUnreachable(dialect);
 		}
-		process.exit(0);
-	},
-});
 
-export const drop = command({
-	name: 'drop',
-	options: {
-		config: optionConfig,
-		out: optionOut,
-		driver: optionDriver,
-	},
-	transform: async (opts) => {
-		const from = assertCollisions('check', opts, [], ['driver', 'out']);
-		return prepareDropParams(opts, from);
-	},
-	handler: async (config) => {
-		await assertOrmCoreVersion();
+		if (init) {
+			if (!migrate) {
+				throw new Error(`--init can't be used with '${dialect}' dialect`);
+			}
 
-		assertV1OutFolder(config.out);
-		await dropMigration(config);
+			console.log();
+			console.log(grey('Applying migration metadata to the database'));
+
+			const migrateInput = {
+				migrationsFolder: out,
+				migrationsTable: migrations.table,
+				migrationsSchema: migrations.schema,
+				// Internal param - won't be displayed in types. Do not remove.
+				init: true,
+			};
+
+			const error = await migrate(migrateInput);
+
+			if (error) {
+				if (error.exitCode === 'localMigrations') {
+					throw new Error("--init can't be used with existing migrations");
+				}
+				if (error.exitCode === 'databaseMigrations') {
+					throw new Error(
+						"--init can't be used when database already has migrations set",
+					);
+				}
+			}
+		}
 	},
 });
 
@@ -683,122 +778,132 @@ export const studio = command({
 			prepareSingleStoreSchema,
 			drizzleForSingleStore,
 			drizzleForLibSQL,
-		} = await import('../serializer/studio');
+			drizzleForDuckDb,
+			// drizzleForMsSQL,
+		} = await import('./commands/studio');
 
 		let setup: Setup;
-		try {
-			if (dialect === 'postgresql') {
-				if ('driver' in credentials) {
-					const { driver } = credentials;
-					if (driver === 'aws-data-api') {
-						if (!(await ormVersionGt('0.30.10'))) {
-							console.log(
-								"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else if (driver === 'pglite') {
-						if (!(await ormVersionGt('0.30.6'))) {
-							console.log(
-								"To use 'pglite' driver - please update drizzle-orm to the latest version",
-							);
-							process.exit(1);
-						}
-					} else {
-						assertUnreachable(driver);
-					}
-				}
 
-				const { schema, relations, files } = schemaPath
-					? await preparePgSchema(schemaPath)
-					: { schema: {}, relations: {}, files: [] };
-				setup = await drizzleForPostgres(credentials, schema, relations, files);
-			} else if (dialect === 'mysql') {
-				const { schema, relations, files } = schemaPath
-					? await prepareMySqlSchema(schemaPath)
-					: { schema: {}, relations: {}, files: [] };
-				setup = await drizzleForMySQL(credentials, schema, relations, files);
-			} else if (dialect === 'sqlite') {
-				const { schema, relations, files } = schemaPath
-					? await prepareSQLiteSchema(schemaPath)
-					: { schema: {}, relations: {}, files: [] };
-				setup = await drizzleForSQLite(credentials, schema, relations, files);
-			} else if (dialect === 'turso') {
-				const { schema, relations, files } = schemaPath
-					? await prepareSQLiteSchema(schemaPath)
-					: { schema: {}, relations: {}, files: [] };
-				setup = await drizzleForLibSQL(credentials, schema, relations, files);
-			} else if (dialect === 'singlestore') {
-				const { schema, relations, files } = schemaPath
-					? await prepareSingleStoreSchema(schemaPath)
-					: { schema: {}, relations: {}, files: [] };
-				setup = await drizzleForSingleStore(
-					credentials,
-					schema,
-					relations,
-					files,
-				);
-			} else if (dialect === 'gel') {
-				console.log(
-					error(
-						`You can't use 'studio' command with Gel dialect`,
-					),
-				);
-				process.exit(1);
-			} else {
-				assertUnreachable(dialect);
+		if (dialect === 'postgresql') {
+			if ('driver' in credentials) {
+				const { driver } = credentials;
+				if (driver === 'aws-data-api') {
+					if (!(await ormVersionGt('0.30.10'))) {
+						console.log(
+							"To use 'aws-data-api' driver - please update drizzle-orm to the latest version",
+						);
+						process.exit(1);
+					}
+				} else if (driver === 'pglite') {
+					if (!(await ormVersionGt('0.30.6'))) {
+						console.log(
+							"To use 'pglite' driver - please update drizzle-orm to the latest version",
+						);
+						process.exit(1);
+					}
+				} else {
+					assertUnreachable(driver);
+				}
 			}
 
-			const { prepareServer } = await import('../serializer/studio');
-
-			const server = await prepareServer(setup);
-
-			console.log();
-			console.log(
-				withStyle.fullWarning(
-					'Drizzle Studio is currently in Beta. If you find anything that is not working as expected or should be improved, feel free to create an issue on GitHub: https://github.com/drizzle-team/drizzle-kit-mirror/issues/new or write to us on Discord: https://discord.gg/WcRKz2FFxN',
-				),
+			const { schema, relations, files } = schemaPath
+				? await preparePgSchema(schemaPath)
+				: { schema: {}, relations: {}, files: [] };
+			setup = await drizzleForPostgres(
+				credentials,
+				schema,
+				relations,
+				files,
 			);
-
-			const { key, cert } = (await certs()) || {};
-			server.start({
-				host,
-				port,
-				key,
-				cert,
-				cb: (err, address) => {
-					if (err) {
-						console.error(err);
-					} else {
-						const queryParams: { port?: number; host?: string } = {};
-						if (port !== 4983) {
-							queryParams.port = port;
-						}
-
-						if (host !== '127.0.0.1') {
-							queryParams.host = host;
-						}
-
-						const queryString = Object.keys(queryParams)
-							.map((key: keyof { port?: number; host?: string }) => {
-								return `${key}=${queryParams[key]}`;
-							})
-							.join('&');
-
-						console.log(
-							`\nDrizzle Studio is up and running on ${
-								chalk.blue(
-									`https://local.drizzle.studio${queryString ? `?${queryString}` : ''}`,
-								)
-							}`,
-						);
-					}
-				},
-			});
-		} catch (e) {
-			console.error(e);
-			process.exit(0);
+		} else if (dialect === 'mysql') {
+			const { schema, relations, files } = schemaPath
+				? await prepareMySqlSchema(schemaPath)
+				: { schema: {}, relations: {}, files: [] };
+			setup = await drizzleForMySQL(
+				credentials,
+				schema,
+				relations,
+				files,
+			);
+		} else if (dialect === 'sqlite') {
+			const { schema, relations, files } = schemaPath
+				? await prepareSQLiteSchema(schemaPath)
+				: { schema: {}, relations: {}, files: [] };
+			setup = await drizzleForSQLite(
+				credentials,
+				schema,
+				relations,
+				files,
+			);
+		} else if (dialect === 'turso') {
+			const { schema, relations, files } = schemaPath
+				? await prepareSQLiteSchema(schemaPath)
+				: { schema: {}, relations: {}, files: [] };
+			setup = await drizzleForLibSQL(
+				credentials,
+				schema,
+				relations,
+				files,
+			);
+		} else if (dialect === 'singlestore') {
+			const { schema, relations, files } = schemaPath
+				? await prepareSingleStoreSchema(schemaPath)
+				: { schema: {}, relations: {}, files: [] };
+			setup = await drizzleForSingleStore(
+				credentials,
+				schema,
+				relations,
+				files,
+			);
+		} else if (dialect === 'duckdb') {
+			setup = await drizzleForDuckDb(credentials);
+		} else if (dialect === 'cockroach') {
+			throw new Error(
+				`You can't use 'studio' command with 'cockroach' dialect`,
+			);
+		} else {
+			assertUnreachable(dialect);
 		}
+
+		const { prepareServer } = await import('./commands/studio');
+		const server = await prepareServer(setup);
+
+		const { certs } = await import('../utils/certs');
+		const { key, cert } = (await certs()) || {};
+		server.start({
+			host,
+			port,
+			key,
+			cert,
+			cb: (err, _address) => {
+				if (err) {
+					console.error(err);
+				} else {
+					const queryParams: { port?: number; host?: string } = {};
+					if (port !== 4983) {
+						queryParams.port = port;
+					}
+
+					if (host !== '127.0.0.1') {
+						queryParams.host = host;
+					}
+
+					const queryString = Object.keys(queryParams)
+						.map((key: keyof { port?: number; host?: string }) => {
+							return `${key}=${queryParams[key]}`;
+						})
+						.join('&');
+
+					console.log(
+						`\nDrizzle Studio is up and running on ${
+							chalk.blue(
+								`https://local.drizzle.studio${queryString ? `?${queryString}` : ''}`,
+							)
+						}`,
+					);
+				}
+			},
+		});
 	},
 });
 
@@ -812,40 +917,42 @@ export const exportRaw = command({
 		schema: string().desc('Path to a schema file or folder'),
 	},
 	transform: async (opts) => {
-		const from = assertCollisions('export', opts, ['sql'], ['dialect', 'schema']);
+		const from = assertCollisions(
+			'export',
+			opts,
+			['sql'],
+			['dialect', 'schema'],
+		);
 		return prepareExportConfig(opts, from);
 	},
 	handler: async (opts) => {
 		await assertOrmCoreVersion();
 		await assertPackages('drizzle-orm');
 
-		const {
-			prepareAndExportPg,
-			prepareAndExportMysql,
-			prepareAndExportSqlite,
-			prepareAndExportLibSQL,
-			prepareAndExportSinglestore,
-		} = await import(
-			'./commands/migrate'
-		);
-
 		const dialect = opts.dialect;
 		if (dialect === 'postgresql') {
-			await prepareAndExportPg(opts);
+			const { handleExport } = await import('./commands/generate-postgres');
+			await handleExport(opts);
 		} else if (dialect === 'mysql') {
-			await prepareAndExportMysql(opts);
+			const { handleExport } = await import('./commands/generate-mysql');
+			await handleExport(opts);
 		} else if (dialect === 'sqlite') {
-			await prepareAndExportSqlite(opts);
+			const { handleExport } = await import('./commands/generate-sqlite');
+			await handleExport(opts);
 		} else if (dialect === 'turso') {
-			await prepareAndExportLibSQL(opts);
+			const { handleExport } = await import('./commands/generate-libsql');
+			await handleExport(opts);
 		} else if (dialect === 'singlestore') {
-			await prepareAndExportSinglestore(opts);
-		} else if (dialect === 'gel') {
-			console.log(
-				error(
-					`You can't use 'export' command with Gel dialect`,
-				),
-			);
+			const { handleExport } = await import('./commands/generate-singlestore');
+			await handleExport(opts);
+		} else if (dialect === 'mssql') {
+			const { handleExport } = await import('./commands/generate-mssql');
+			await handleExport(opts);
+		} else if (dialect === 'cockroach') {
+			const { handleExport } = await import('./commands/generate-cockroach');
+			await handleExport(opts);
+		} else if (dialect === 'duckdb') {
+			console.log(error(`You can't use 'export' command with DuckDb dialect`));
 			process.exit(1);
 		} else {
 			assertUnreachable(dialect);

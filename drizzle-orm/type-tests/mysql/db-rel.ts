@@ -1,16 +1,12 @@
-import pg from 'pg';
 import { type Equal, Expect } from 'type-tests/utils.ts';
-import { drizzle } from '~/node-postgres/index.ts';
+import { drizzle } from '~/mysql2/index.ts';
 import { placeholder, sql } from '~/sql/sql.ts';
 import * as schema from './tables-rel.ts';
 
-const { Pool } = pg;
-
-const pdb = new Pool({ connectionString: process.env['PG_CONNECTION_STRING'] });
-const db = drizzle(pdb, { schema });
+const db = drizzle({ connection: process.env['MYSQL_CONNECTION_STRING']!, schema, mode: 'default' });
 
 {
-	const result = await db.query.users.findMany({
+	const result = await db._query.users.findMany({
 		where: (users, { sql }) => sql`char_length(${users.name} > 1)`,
 		limit: placeholder('l'),
 		orderBy: (users, { asc, desc }) => [asc(users.name), desc(users.id)],
@@ -86,7 +82,7 @@ const db = drizzle(pdb, { schema });
 }
 
 {
-	const result = await db.query.users.findMany({
+	const result = await db._query.users.findMany({
 		columns: {
 			id: true,
 			name: true,
