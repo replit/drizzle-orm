@@ -15,6 +15,15 @@
 <br/>
 <br/>
 
+### Replit development
+
+We use `drizzle-kit` for handling database migrations. However in order expose `drizzle-kit`s internal functions (which are not exported by default) they suggested cloning the `drizzle-orm` repo and making our changes just to the `drizzle-kit/api` file ([see here](./drizzle-kit/src/api.ts)) to build an external API particular for our use case.
+
+We do not require/import any of the other packages in this repo.
+
+#### Getting started
+To get started see the `drizzle-kit` ([README.md]./drizzle-kit/README.md).
+
 ### What's Drizzle?
 Drizzle is a modern TypeScript ORM developers [wanna use in their next project](https://stateofdb.com/tools/drizzle). 
 It is [lightweight](https://bundlephobia.com/package/drizzle-orm) at only ~7.4kb minified+gzipped, and it's tree shakeable with exactly 0 dependencies. 

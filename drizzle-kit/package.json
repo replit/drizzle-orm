@@ -97,7 +97,7 @@
 		"dockerode": "^4.0.6",
 		"dotenv": "^16.0.3",
 		"drizzle-kit": "^0.31.6",
-		"drizzle-orm": "workspace:./drizzle-orm/dist",
+		"drizzle-orm": "workspace:../drizzle-orm/dist",
 		"env-paths": "^3.0.0",
 		"get-port": "^6.1.2",
 		"glob": "^8.1.0",

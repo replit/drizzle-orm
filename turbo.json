@@ -61,7 +61,7 @@
 			],
 			"outputLogs": "new-only"
 		},
-		"drizzle-kit#build": {
+		"@drizzle-team/drizzle-kit#build": {
 			"dependsOn": [
 				"drizzle-orm#build"
 			],

@@ -26,6 +26,13 @@ const driversPackages = [
 	'@duckdb/node-api',
 ];
 
+// Problematic dependencies that should be external
+const externalDeps = [
+	'json-diff',
+	'commander',
+	'glob',
+];
+
 esbuild.buildSync({
 	entryPoints: ['./src/cli/index.ts'],
 	bundle: true,
@@ -50,7 +57,7 @@ const main = async () => {
 	await tsup.build({
 		entryPoints: ['./src/index.ts'],
 		outDir: './dist',
-		external: driversPackages,
+		external: [...driversPackages, ...externalDeps],
 		splitting: false,
 		dts: true,
 		format: ['cjs', 'esm'],
@@ -75,6 +82,7 @@ const main = async () => {
 			'esbuild',
 			'drizzle-orm',
 			...driversPackages,
+			...externalDeps,
 		],
 		splitting: false,
 		dts: true,
