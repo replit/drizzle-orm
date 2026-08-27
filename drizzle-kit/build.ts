@@ -57,7 +57,7 @@ const main = async () => {
 	await tsup.build({
 		entryPoints: ['./src/index.ts'],
 		outDir: './dist',
-		external: driversPackages,
+		external: [...driversPackages, ...externalDeps],
 		splitting: false,
 		dts: true,
 		format: ['cjs', 'esm'],
@@ -82,6 +82,7 @@ const main = async () => {
 			'esbuild',
 			'drizzle-orm',
 			...driversPackages,
+			...externalDeps,
 		],
 		splitting: false,
 		dts: true,
