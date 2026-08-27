@@ -257,8 +257,8 @@ importers:
         specifier: ^0.31.6
         version: 0.31.7
       drizzle-orm:
-        specifier: workspace:./drizzle-orm/dist
-        version: link:drizzle-orm/dist
+        specifier: workspace:../drizzle-orm/dist
+        version: link:../drizzle-orm/dist
       env-paths:
         specifier: ^3.0.0
         version: 3.0.0
