@@ -720,6 +720,76 @@ test('add column before creating unique constraint', async () => {
 	]);
 });
 
+test('add column before replacing composite primary key', async () => {
+	const from = {
+		requests: pgTable('assistant_requests', {
+			requestId: text('request_id').primaryKey(),
+		}),
+	};
+	const to = {
+		requests: pgTable('assistant_requests', {
+			requestId: text('request_id').notNull(),
+			userId: text('user_id').notNull(),
+		}, (t) => ({
+			pk: primaryKey({
+				name: 'assistant_requests_user_id_request_id_pk',
+				columns: [t.requestId, t.userId],
+			}),
+		})),
+	};
+
+	const { sqlStatements } = await diffTestSchemas(from, to, []);
+	const addColumn = sqlStatements.findIndex((statement) => statement.includes('ADD COLUMN "user_id"'));
+	const addPrimaryKey = sqlStatements.findIndex((statement) =>
+		statement.includes('ADD CONSTRAINT "assistant_requests_user_id_request_id_pk"')
+	);
+
+	expect(addColumn).toBeGreaterThanOrEqual(0);
+	expect(addPrimaryKey).toBeGreaterThanOrEqual(0);
+	expect(addColumn).toBeLessThan(addPrimaryKey);
+});
+
+test('create parent unique constraint before dependent foreign key', async () => {
+	const parentFrom = pgTable('parent', {
+		id: integer('id').notNull(),
+		orgId: integer('org_id').notNull(),
+	});
+	const childFrom = pgTable('child', {
+		parentId: integer('parent_id').notNull(),
+		orgId: integer('org_id').notNull(),
+	});
+	const parentTo = pgTable('parent', {
+		id: integer('id').notNull(),
+		orgId: integer('org_id').notNull(),
+	}, (t) => ({
+		idOrgUnique: unique('parent_id_org_unique').on(t.id, t.orgId),
+	}));
+	const childTo = pgTable('child', {
+		parentId: integer('parent_id').notNull(),
+		orgId: integer('org_id').notNull(),
+	}, (t) => ({
+		parent: foreignKey({
+			name: 'child_parent_id_org_fk',
+			columns: [t.parentId, t.orgId],
+			foreignColumns: [parentTo.id, parentTo.orgId],
+		}),
+	}));
+
+	const { sqlStatements } = await diffTestSchemas(
+		{ parent: parentFrom, child: childFrom },
+		{ parent: parentTo, child: childTo },
+		[],
+	);
+	const addUnique = sqlStatements.findIndex((statement) => statement.includes('ADD CONSTRAINT "parent_id_org_unique"'));
+	const addForeignKey = sqlStatements.findIndex((statement) =>
+		statement.includes('ADD CONSTRAINT "child_parent_id_org_fk"')
+	);
+
+	expect(addUnique).toBeGreaterThanOrEqual(0);
+	expect(addForeignKey).toBeGreaterThanOrEqual(0);
+	expect(addUnique).toBeLessThan(addForeignKey);
+});
+
 test('alter composite primary key', async () => {
 	const from = {
 		table: pgTable('table', {
@@ -885,7 +955,7 @@ test('optional db aliases (snake case)', async () => {
 
 	const st7 = `CREATE INDEX "t1_idx" ON "t1" USING btree ("t1_idx") WHERE "t1"."t1_idx" > 0;`;
 
-	expect(sqlStatements).toStrictEqual([st1, st2, st3, st4, st5, st6, st7]);
+	expect(sqlStatements).toStrictEqual([st1, st2, st3, st6, st7, st4, st5]);
 });
 
 test('optional db aliases (camel case)', async () => {
@@ -975,5 +1045,5 @@ test('optional db aliases (camel case)', async () => {
 
 	const st7 = `CREATE INDEX "t1Idx" ON "t1" USING btree ("t1Idx") WHERE "t1"."t1Idx" > 0;`;
 
-	expect(sqlStatements).toStrictEqual([st1, st2, st3, st4, st5, st6, st7]);
+	expect(sqlStatements).toStrictEqual([st1, st2, st3, st6, st7, st4, st5]);
 });

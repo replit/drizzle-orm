@@ -1988,22 +1988,20 @@ export const applyPgSnapshotsDiff = async (
 
 	jsonStatements.push(...jsonDeletedCompositePKs);
 	jsonStatements.push(...jsonTableAlternations);
-	jsonStatements.push(...jsonAddedCompositePKs);
 	jsonStatements.push(...jsonAddColumnsStatemets);
-
-	jsonStatements.push(...jsonCreateReferencesForCreatedTables);
-	jsonStatements.push(...jsonCreateIndexesForCreatedTables);
-
-	jsonStatements.push(...jsonCreatedReferencesForAlteredTables);
-	jsonStatements.push(...jsonCreateIndexesFoAlteredTables);
-
+	jsonStatements.push(...jsonAddedCompositePKs);
 	jsonStatements.push(...jsonDropColumnsStatemets);
 	jsonStatements.push(...jsonAlteredCompositePKs);
 
 	jsonStatements.push(...jsonAddedUniqueConstraints);
-	jsonStatements.push(...jsonCreatedCheckConstraints);
-
 	jsonStatements.push(...jsonAlteredUniqueConstraints);
+	jsonStatements.push(...jsonCreateIndexesForCreatedTables);
+	jsonStatements.push(...jsonCreateIndexesFoAlteredTables);
+
+	jsonStatements.push(...jsonCreateReferencesForCreatedTables);
+	jsonStatements.push(...jsonCreatedReferencesForAlteredTables);
+
+	jsonStatements.push(...jsonCreatedCheckConstraints);
 
 	jsonStatements.push(...createViews);
 
