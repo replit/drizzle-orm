@@ -73,12 +73,29 @@ export type SelectResolverOutput = {
 	};
 };
 
+export type PgSuggestionsRowCheck = 'exact' | 'exists';
+
+async function getRowCount(db: DB, tableName: string, rowCheck: PgSuggestionsRowCheck) {
+	if (rowCheck === 'exists') {
+		const rows = await db.query(`select 1 from ${tableName} limit 1`);
+		return rows.length;
+	}
+
+	const rows = await db.query<{ count: string | number }>(`select count(*) as count from ${tableName}`);
+	return Number(rows[0].count);
+}
+
+function describeRowCount(count: number, rowCheck: PgSuggestionsRowCheck) {
+	return rowCheck === 'exact' ? `${count} items` : 'existing items';
+}
+
 export const pgSuggestions = async (
 	db: DB,
 	statements: JsonStatement[],
 	selectResolver?: (
 		input: SelectResolverInput,
 	) => Promise<SelectResolverOutput>,
+	rowCheck: PgSuggestionsRowCheck = 'exact',
 ) => {
 	let shouldAskForApprove = false;
 	const statementsToExecute: string[] = [];
@@ -99,14 +116,17 @@ export const pgSuggestions = async (
 		} else if (statement.type === 'rename_table') {
 			renamedTables[concatSchemaAndTableName(statement.toSchema, statement.tableNameTo)] = statement.tableNameFrom;
 		} else if (statement.type === 'drop_table') {
-			const res = await db.query(
-				`select count(*) as count from ${
-					tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables)
-				}`,
+			const count = await getRowCount(
+				db,
+				tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables),
+				rowCheck,
 			);
-			const count = Number(res[0].count);
 			if (count > 0) {
-				infoToPrint.push(`· You're about to delete ${chalk.underline(statement.tableName)} table with ${count} items`);
+				infoToPrint.push(
+					`· You're about to delete ${chalk.underline(statement.tableName)} table with ${
+						describeRowCount(count, rowCheck)
+					}`,
+				);
 				// statementsToExecute.push(
 				//   `truncate table ${tableNameWithSchemaFrom(statement)} cascade;`
 				// );
@@ -114,28 +134,28 @@ export const pgSuggestions = async (
 				shouldAskForApprove = true;
 			}
 		} else if (statement.type === 'drop_view' && statement.materialized) {
-			const res = await db.query(`select count(*) as count from "${statement.schema ?? 'public'}"."${statement.name}"`);
-			const count = Number(res[0].count);
+			const count = await getRowCount(db, `"${statement.schema ?? 'public'}"."${statement.name}"`, rowCheck);
 			if (count > 0) {
 				infoToPrint.push(
-					`· You're about to delete "${chalk.underline(statement.name)}" materialized view with ${count} items`,
+					`· You're about to delete "${chalk.underline(statement.name)}" materialized view with ${
+						describeRowCount(count, rowCheck)
+					}`,
 				);
 
 				matViewsToRemove.push(statement.name);
 				shouldAskForApprove = true;
 			}
 		} else if (statement.type === 'alter_table_drop_column') {
-			const res = await db.query(
-				`select count(*) as count from ${
-					tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables)
-				}`,
+			const count = await getRowCount(
+				db,
+				tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables),
+				rowCheck,
 			);
-			const count = Number(res[0].count);
 			if (count > 0) {
 				infoToPrint.push(
 					`· You're about to delete ${
 						chalk.underline(statement.columnName)
-					} column in ${statement.tableName} table with ${count} items`,
+					} column in ${statement.tableName} table with ${describeRowCount(count, rowCheck)}`,
 				);
 				columnsToRemove.push(`${statement.tableName}_${statement.columnName}`);
 				shouldAskForApprove = true;
@@ -151,12 +171,11 @@ export const pgSuggestions = async (
 				shouldAskForApprove = true;
 			}
 		} else if (statement.type === 'alter_table_alter_column_set_type') {
-			const res = await db.query(
-				`select count(*) as count from ${
-					tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables)
-				}`,
+			const count = await getRowCount(
+				db,
+				tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables),
+				rowCheck,
 			);
-			const count = Number(res[0].count);
 			if (count > 0) {
 				infoToPrint.push(
 					`· You're about to change ${chalk.underline(statement.columnName)} column type from ${
@@ -165,7 +184,7 @@ export const pgSuggestions = async (
 						chalk.underline(
 							statement.newDataType,
 						)
-					} with ${count} items`,
+					} with ${describeRowCount(count, rowCheck)}`,
 				);
 				statementsToExecute.push(
 					`truncate table ${
@@ -176,12 +195,11 @@ export const pgSuggestions = async (
 				shouldAskForApprove = true;
 			}
 		} else if (statement.type === 'alter_table_alter_column_drop_pk') {
-			const res = await db.query(
-				`select count(*) as count from ${
-					tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables)
-				}`,
+			const count = await getRowCount(
+				db,
+				tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables),
+				rowCheck,
 			);
-			const count = Number(res[0].count);
 			if (count > 0) {
 				infoToPrint.push(
 					`· You're about to change ${
@@ -216,17 +234,16 @@ export const pgSuggestions = async (
 			continue;
 		} else if (statement.type === 'alter_table_add_column') {
 			if (statement.column.notNull && typeof statement.column.default === 'undefined') {
-				const res = await db.query(
-					`select count(*) as count from ${
-						tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables)
-					}`,
+				const count = await getRowCount(
+					db,
+					tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables),
+					rowCheck,
 				);
-				const count = Number(res[0].count);
 				if (count > 0) {
 					infoToPrint.push(
 						`· You're about to add not-null ${
 							chalk.underline(statement.column.name)
-						} column without default value, which contains ${count} items`,
+						} column without default value, which contains ${describeRowCount(count, rowCheck)}`,
 					);
 
 					tablesToTruncate.push(statement.tableName);
@@ -240,12 +257,11 @@ export const pgSuggestions = async (
 				}
 			}
 		} else if (statement.type === 'create_unique_constraint') {
-			const res = await db.query(
-				`select count(*) as count from ${
-					tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables)
-				}`,
+			const count = await getRowCount(
+				db,
+				tableNameWithSchemaFrom(statement.schema, statement.tableName, renamedSchemas, renamedTables),
+				rowCheck,
 			);
-			const count = Number(res[0].count);
 			if (count > 0) {
 				const unsquashedUnique = PgSquasher.unsquashUnique(statement.data);
 				console.log(
@@ -253,7 +269,9 @@ export const pgSuggestions = async (
 						chalk.underline(
 							unsquashedUnique.name,
 						)
-					} unique constraint to the table, which contains ${count} items. If this statement fails, you will receive an error from the database. Do you want to truncate ${
+					} unique constraint to the table, which contains ${
+						describeRowCount(count, rowCheck)
+					}. If this statement fails, you will receive an error from the database. Do you want to truncate ${
 						chalk.underline(
 							statement.tableName,
 						)
