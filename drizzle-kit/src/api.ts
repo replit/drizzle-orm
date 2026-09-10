@@ -17,6 +17,7 @@ import { originUUID } from './global';
 import { MySqlSchema as MySQLSchemaKit } from './serializer/mysqlSchema';
 import { PgSchema as PgSchemaKit, pgSchema, Role, squashPgScheme, View } from './serializer/pgSchema';
 import { fromDatabase } from './serializer/pgSerializer';
+import type { PgIntrospectionOptions } from './serializer/pgSerializer';
 import { SingleStoreSchema as SingleStoreSchemaKit } from './serializer/singlestoreSchema';
 import { SQLiteSchema as SQLiteSchemaKit } from './serializer/sqliteSchema';
 import { ProxyParams } from './serializer/studio';
@@ -40,6 +41,7 @@ export type DrizzlePgDBIntrospectSchema = Omit<
 	PgSchemaKit,
 	'internal'
 >;
+export type DrizzlePgIntrospectionOptions = PgIntrospectionOptions;
 
 function createConcurrencyLimiter(concurrency?: number) {
 	if (concurrency === undefined) {
@@ -84,6 +86,7 @@ export const introspectPgDB = async (
 	db: DrizzlePgDB,
 	filters: string[],
 	schemaFilters: string[],
+	options: DrizzlePgIntrospectionOptions = {},
 ): Promise<DrizzlePgDBIntrospectSchema> => {
 	const matchers = filters.map((it) => {
 		return new Minimatch(it);
@@ -119,6 +122,7 @@ export const introspectPgDB = async (
 		undefined,
 		undefined,
 		undefined,
+		options,
 	);
 
 	const schema = { id: originUUID, prevId: '', ...res } as PgSchemaKit;

@@ -966,6 +966,11 @@ function prepareRoles(entities?: {
 	return { useRoles, includeRoles, excludeRoles };
 }
 
+export type PgIntrospectionOptions = {
+	batchConstraintQueries?: boolean;
+	onConstraintPreloadError?: (error: unknown) => void;
+};
+
 export const fromDatabase = async (
 	db: DB,
 	tablesFilter: (table: string) => boolean = () => true,
@@ -983,11 +988,66 @@ export const fromDatabase = async (
 		status: IntrospectStatus,
 	) => void,
 	tsSchema?: PgSchemaInternal,
+	options: PgIntrospectionOptions = {},
 ): Promise<PgSchemaInternal> => {
 	const result: Record<string, Table> = {};
 	const views: Record<string, View> = {};
 	const policies: Record<string, Policy> = {};
 	const internals: PgKitInternals = { tables: {} };
+	const constraintsSql = `
+		SELECT rel.relname AS table_name, att.attname::text AS column_name,
+			CASE con.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'u' THEN 'UNIQUE' END AS constraint_type,
+			con.conname AS constraint_name
+		FROM pg_catalog.pg_constraint con
+		JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+		JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+		CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS key_pair(attnum, ordinality)
+		JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key_pair.attnum
+		WHERE nsp.nspname = $1 AND con.contype IN ('p', 'u')
+			AND pg_has_role(rel.relowner, 'USAGE')
+		ORDER BY rel.relname, con.conname, key_pair.ordinality`;
+	const primaryKeyNamesSql = `
+		SELECT rel.relname AS table_name, con.conname AS primary_key
+		FROM pg_catalog.pg_constraint con
+		JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+		WHERE con.contype = 'p' AND con.connamespace = $1::regnamespace`;
+
+	function createBatchLoader<Row extends { table_name: string }>(sql: string) {
+		const preloads = new Map<string, Promise<Map<string, Row[]> | undefined>>();
+
+		return async (schema: string, table: string): Promise<Row[] | undefined> => {
+			if (!options.batchConstraintQueries) return undefined;
+
+			let pending = preloads.get(schema);
+			if (!pending) {
+				pending = db.query<Row>(sql, [schema]).then((rows) => {
+					const byTable = new Map<string, Row[]>();
+					for (const row of rows) {
+						const existing = byTable.get(row.table_name);
+						if (existing) existing.push(row);
+						else byTable.set(row.table_name, [row]);
+					}
+
+					return byTable;
+				}).catch((error) => {
+					options.onConstraintPreloadError?.(error);
+					return undefined;
+				});
+				preloads.set(schema, pending);
+			}
+
+			const byTable = await pending;
+			return byTable === undefined ? undefined : byTable.get(table) ?? [];
+		};
+	}
+
+	const loadConstraints = createBatchLoader<{
+		table_name: string;
+		column_name: string;
+		constraint_type: 'PRIMARY KEY' | 'UNIQUE';
+		constraint_name: string;
+	}>(constraintsSql);
+	const loadPrimaryKeyNames = createBatchLoader<{ table_name: string; primary_key: string }>(primaryKeyNamesSql);
 
 	const where = schemaFilters.map((t) => `n.nspname = '${t}'`).join(' or ');
 
@@ -1228,7 +1288,7 @@ WHERE
 
 					const tableResponse = await getColumnsInfoQuery({ schema: tableSchema, table: tableName, db });
 
-					const tableConstraints = await db.query(
+					const tableConstraints = await loadConstraints(tableSchema, tableName) ?? await db.query(
 						`SELECT c.column_name, c.data_type, constraint_type, constraint_name, constraint_schema
       FROM information_schema.table_constraints tc
       JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
@@ -1405,7 +1465,7 @@ WHERE
 						const cprimaryKey = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'PRIMARY KEY');
 
 						if (cprimaryKey.length > 1) {
-							const tableCompositePkName = await db.query(
+							const tableCompositePkName = await loadPrimaryKeyNames(tableSchema, tableName) ?? await db.query(
 								`SELECT conname AS primary_key
             FROM   pg_constraint join pg_class on (pg_class.oid = conrelid)
             WHERE  contype = 'p' 
