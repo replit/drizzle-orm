@@ -775,6 +775,10 @@ const mapDefault = (
 	}
 
 	if (lowered.startsWith('jsonb')) {
+		if (isExpression) {
+			return `.default(${mapColumnDefault(defaultValue, true)})`;
+		}
+
 		const def = typeof defaultValue !== 'undefined'
 			? defaultValue.replace(/::(.*?)(?<![^\w"])(?=$)/, '').slice(1, -1)
 			: null;
@@ -783,6 +787,10 @@ const mapDefault = (
 	}
 
 	if (lowered.startsWith('json')) {
+		if (isExpression) {
+			return `.default(${mapColumnDefault(defaultValue, true)})`;
+		}
+
 		const def = defaultValue ? defaultValue.replace(/::(.*?)(?<![^\w"])(?=$)/, '').slice(1, -1) : null;
 
 		return typeof defaultValue !== 'undefined' ? `.default(${def})` : '';

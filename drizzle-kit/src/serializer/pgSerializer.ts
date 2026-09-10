@@ -2038,6 +2038,7 @@ export const defaultForColumn = (column: any, internals: PgKitInternals, tableNa
 	) {
 		return undefined;
 	}
+	const originalColumnDefault = column.column_default.toString();
 
 	if (column.column_default.endsWith('[]')) {
 		column.column_default = column.column_default.slice(0, -2);
@@ -2099,7 +2100,7 @@ export const defaultForColumn = (column: any, internals: PgKitInternals, tableNa
 				internals!.tables![tableName]!.columns[columnName]!.isDefaultAnExpression = true;
 			}
 
-			return columnDefaultAsString;
+			return originalColumnDefault;
 		}
 
 		const jsonWithoutSpaces = JSON.stringify(JSON.parse(columnDefaultAsString.slice(1, -1)));

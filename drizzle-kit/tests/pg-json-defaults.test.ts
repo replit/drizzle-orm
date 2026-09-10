@@ -1,6 +1,8 @@
 import { expect, test } from 'vitest';
 import { introspectPgDB } from '../src/api';
 import type { DrizzlePgDB } from '../src/api';
+import { schemaToTypeScript } from '../src/introspect-pg';
+import { fromDatabase } from '../src/serializer/pgSerializer';
 
 const columnRow = {
 	table_name: 'items',
@@ -48,4 +50,12 @@ test('normalizes a quoted jsonb literal default', async () => {
 	const schema = await introspectPgDB(databaseWithDefault(`'{"kind": "record"}'::jsonb`), [], ['public']);
 
 	expect(schema.tables['public.items']!.columns.payload!.default).toBe(`'{"kind":"record"}'::jsonb`);
+});
+
+test('preserves casts and generates SQL for jsonb expression defaults', async () => {
+	const expression = "current_setting('app.payload')::jsonb";
+	const schema = await fromDatabase(databaseWithDefault(expression), () => true, ['public']);
+
+	expect(schema.tables['public.items']!.columns.payload!.default).toBe(expression);
+	expect(schemaToTypeScript(schema, 'preserve').file).toContain(`.default(sql\`${expression}\`)`);
 });
