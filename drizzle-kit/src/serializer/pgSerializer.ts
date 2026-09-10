@@ -2038,6 +2038,7 @@ export const defaultForColumn = (column: any, internals: PgKitInternals, tableNa
 	) {
 		return undefined;
 	}
+	const originalColumnDefault = column.column_default.toString();
 
 	if (column.column_default.endsWith('[]')) {
 		column.column_default = column.column_default.slice(0, -2);
@@ -2082,6 +2083,26 @@ export const defaultForColumn = (column: any, internals: PgKitInternals, tableNa
 		// if numeric(1,1) and used '99' -> psql stores like '99'::numeric
 		return columnDefaultAsString.includes("'") ? columnDefaultAsString : `'${columnDefaultAsString}'`;
 	} else if (column.data_type === 'json' || column.data_type === 'jsonb') {
+		if (!columnDefaultAsString.startsWith("'") || !columnDefaultAsString.endsWith("'")) {
+			if (typeof internals!.tables![tableName] === 'undefined') {
+				internals!.tables![tableName] = {
+					columns: {
+						[columnName]: {
+							isDefaultAnExpression: true,
+						},
+					},
+				};
+			} else if (typeof internals!.tables![tableName]!.columns[columnName] === 'undefined') {
+				internals!.tables![tableName]!.columns[columnName] = {
+					isDefaultAnExpression: true,
+				};
+			} else {
+				internals!.tables![tableName]!.columns[columnName]!.isDefaultAnExpression = true;
+			}
+
+			return originalColumnDefault;
+		}
+
 		const jsonWithoutSpaces = JSON.stringify(JSON.parse(columnDefaultAsString.slice(1, -1)));
 		return `'${jsonWithoutSpaces}'::${column.data_type}`;
 	} else if (column.data_type === 'boolean') {
